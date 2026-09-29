@@ -1,0 +1,28 @@
+{
+  "server": "http://10.168.1.112:8188",
+  "clip_name": "qwen3vl_8b_fp8_scaled.safetensors",
+  "clip_type": "ideogram4",
+  "device": "default",
+  "max_length": 1024,
+  "temperature": 0.3,
+  "top_k": 64,
+  "top_p": 0.95,
+  "min_p": 0.05,
+  "repetition_penalty": 1.05,
+  "seed": 0,
+  "thinking": false,
+  "use_default_template": true,
+  "per_subscription_limit": 5,
+  "subtitle_max_chars": 12000,
+  "desc_max_chars": 4000,
+  "focus_points": [
+    "�ĵ�/�����������ӣ����̡��ĵ�վ�ȣ�",
+    "����ֿ������Ƭ��˵��",
+    "��Ƶ���ᵽ�Ĺ����嵥",
+    "�̳̻��������Ҫ��",
+    "�����뽨��"
+  ],
+  "link_rules": [],
+  "summary_prompt": "你是资料整理助手。下面是一个视频的标题、简介和字幕（可能缺失部分），请整理成结构化知识文档。用户特别关注：{focus}。\n严格按如下 JSON 输出，不要输出多余文字：\n{{\"summary\":\"<100~200字的中文总结>\",\"key_points\":[\"<要点1>\",\"<要点2>\",...],\"resources\":[{{\"type\":\"<类型>\",\"value\":\"<链接或名称>\",\"note\":\"<说明>\"}}]}}\n\n【标题】{title}\n【博主】{author}\n【发布时间】{pubdate}\n【简介】\n{desc}\n\n【字幕】\n{subtitle}\n\n【已提取的链接】\n{links}",
+  "ask_prompt": "你是资料问答助手。请只依据下面的文库资料回答问题；资料中没有的信息要明确说明没有找到，不要编造。回答用中文，条理清晰，并在末尾列出用到的资料编号。\n\n【问题】{question}\n\n【文库资料】\n{context}"
+}

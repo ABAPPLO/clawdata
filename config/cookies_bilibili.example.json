@@ -1,0 +1,4 @@
+{
+  "_说明": "B站登录 Cookie（可选）。匿名只能拿 360P/480P；登录后可提升到账号允许的清晰度。把浏览器里 bilibili.com 的 Cookie 整段复制到 raw 字段即可。不要提交此文件。",
+  "raw": "SESSDATA=xxx; buvid3=xxx; bili_jct=xxx"
+}

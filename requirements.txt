@@ -1,0 +1,10 @@
+# 抖音 Web 签名用（abogus_impl.py 已 vendor，仅需 gmssl）
+gmssl>=3.2
+# 浏览器自动化采集热点视频（复用系统 Edge，无需下载浏览器内核）
+playwright>=1.40
+# 连续动作筛选（工具页）：YOLO 人体姿态检测（ONNX）+ OpenCV 抽帧/切片段
+opencv-python>=5.0
+numpy>=2.0
+onnxruntime>=1.29
+# 导出浏览器可播的 H.264 片段（内置静态 ffmpeg，含 libx264）
+imageio-ffmpeg>=0.5

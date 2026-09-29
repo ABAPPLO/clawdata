@@ -1,0 +1,4 @@
+{
+  "说明": "把下面替换成你登录抖音后的 Cookie。两种写法均可：",
+  "raw": "ttwid=xxx; __ac_nonce=xxx; sessionid=xxx; sid_guard=xxx; passport_csrf_token=xxx; ..."
+}

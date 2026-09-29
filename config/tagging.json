@@ -1,0 +1,25 @@
+{
+  "server": "http://10.168.1.106:8818",
+  "clip_name": "qwen3vl_8b_fp8_scaled.safetensors",
+  "clip_type": "ideogram4",
+  "device": "default",
+  "num_frames": 6,
+  "strategy": "uniform",
+  "seed": 0,
+  "max_length": 512,
+  "temperature": 0.2,
+  "top_k": 64,
+  "top_p": 0.95,
+  "min_p": 0.05,
+  "repetition_penalty": 1.05,
+  "presence_penalty": 0.0,
+  "thinking": false,
+  "use_default_template": true,
+  "max_tags": 6,
+  "categories": [
+    "美食", "宠物", "搞笑", "剧情/短剧", "知识科普", "音乐", "舞蹈",
+    "游戏", "科技数码", "户外旅行", "动漫", "时尚美妆", "运动健身", "单人武术展示",
+    "汽车", "亲子育儿", "生活Vlog", "新闻资讯", "影视", "教育", "直播", "其他"
+  ],
+  "prompt": "请观察这个短视频画面的多个关键帧，综合判断它属于哪一类视频，并给出 3~6 个中文标签和一句话摘要。类别只能从下面列表中选：{categories}。严格按如下 JSON 输出，不要输出多余文字：{\"category\":\"<类别>\",\"tags\":[\"<标签1>\",\"<标签2>\",...],\"summary\":\"<一句话摘要>\"}"
+}

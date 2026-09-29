@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.zcode/
+
+config/cookies.json
+config/cookies_bilibili.json
+edge-bilibili-profile/
+*.log
+
+data/
+downloads/
+out/
+edge-debug-profile*/
+models/*.onnx
+

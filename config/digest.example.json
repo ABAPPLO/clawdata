@@ -1,0 +1,26 @@
+{
+  "server": "http://10.168.1.112:8188",
+  "clip_name": "qwen3vl_8b_fp8_scaled.safetensors",
+  "clip_type": "ideogram4",
+  "device": "default",
+  "max_length": 1024,
+  "temperature": 0.3,
+  "top_k": 64,
+  "top_p": 0.95,
+  "min_p": 0.05,
+  "repetition_penalty": 1.05,
+  "seed": 0,
+  "thinking": false,
+  "use_default_template": true,
+  "per_subscription_limit": 5,
+  "subtitle_max_chars": 12000,
+  "desc_max_chars": 4000,
+  "focus_points": [
+    "文档/资料下载链接（网盘、文档站等）",
+    "代码仓库与代码片段说明",
+    "视频中提到的工具清单",
+    "教程或操作步骤要点",
+    "结论与建议"
+  ],
+  "link_rules": []
+}
