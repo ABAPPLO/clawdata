@@ -106,6 +106,8 @@ curl -X POST http://127.0.0.1:8000/api/subscriptions/add \
 
 # 触发订阅下载刷新（下载新视频，与文库整理无关）：id 缺省/0 = 到期订阅全部
 curl -X POST http://127.0.0.1:8000/api/subscriptions/refresh -H "Content-Type: application/json" -d '{"id": 3}'
+# 下载为逐页进行：一页全部下载完才翻下一页（页间随机停顿数秒），某页无新视频即停止；
+# 首次刷新会自动回溯订阅前的历史作品（单次上限约 20 页）。抖音接口翻页失败自动回退浏览器采集最新一批。
 
 # 某订阅已下载的视频
 curl "http://127.0.0.1:8000/api/subscriptions/videos?id=3"

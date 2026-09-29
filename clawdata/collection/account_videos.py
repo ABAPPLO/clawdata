@@ -20,11 +20,13 @@
 from __future__ import annotations
 
 import json
+import random
 import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterator
 from typing import Any
 
 from clawdata.core.session import cookie_header
@@ -179,18 +181,24 @@ def _post_params(sec_uid: str, cursor: int, count: int) -> dict[str, str]:
     }
 
 
-def fetch_account_videos(
+def iter_account_video_pages(
     sec_uid: str,
     cookies: dict[str, str],
-    count: int = 10,
-    timeout: float = 15.0,
+    per_page: int = 20,
     max_pages: int = 20,
-) -> list[dict[str, Any]]:
-    """拉取某个账号的作品列表，返回解析后的视频条目（按发布时间倒序）。"""
+    timeout: float = 15.0,
+    page_delay: tuple[float, float] = (1.5, 3.5),
+) -> Iterator[list[dict[str, Any]]]:
+    """逐页拉取账号作品列表（cursor 翻页，按发布时间倒序）。
+
+    每页 yield 解析后的条目列表（同 _parse_aweme 结构，去重）；取下一页前
+    随机停顿 page_delay 秒，模拟人类翻页。has_more=0、cursor 不再前进或达到
+    max_pages 时停止。调用方 break 后生成器即被丢弃，不会再发请求。
+    """
     cursor = 0
-    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for _page in range(max_pages):
-        url = _signed_url(POST_URL, _post_params(sec_uid, cursor, count))
+        url = _signed_url(POST_URL, _post_params(sec_uid, cursor, per_page))
         headers = {
             "User-Agent": UA,
             "Cookie": cookie_header(cookies),
@@ -205,22 +213,41 @@ def fetch_account_videos(
 
         data = obj.get("data", {}) or {}
         aweme_list = data.get("aweme_list", []) or []
+        items: list[dict[str, Any]] = []
         for aweme in aweme_list:
             parsed = _parse_aweme(aweme, sec_uid)
-            if parsed.get("url"):
-                out.append(parsed)
-            if len(out) >= count:
-                break
-        if len(out) >= count:
-            break
+            aweme_id = str(parsed.get("aweme_id") or "")
+            if not parsed.get("url") or not aweme_id or aweme_id in seen:
+                continue
+            seen.add(aweme_id)
+            items.append(parsed)
+        yield items
 
         has_more = data.get("has_more", 0)
         next_cursor = data.get("max_cursor", 0)
         if not has_more or not next_cursor or next_cursor == cursor:
-            break
+            return
         cursor = next_cursor
-        time.sleep(0.6)  # 翻页间隔，减轻风控压力
+        time.sleep(random.uniform(*page_delay))
 
+
+def fetch_account_videos(
+    sec_uid: str,
+    cookies: dict[str, str],
+    count: int = 10,
+    timeout: float = 15.0,
+    max_pages: int = 20,
+) -> list[dict[str, Any]]:
+    """拉取某个账号的作品列表，返回解析后的视频条目（按发布时间倒序）。"""
+    out: list[dict[str, Any]] = []
+    per_page = max(1, min(count, 20))
+    pages = max(1, min(max_pages, -(-max(count, 1) // per_page)))
+    for page in iter_account_video_pages(
+        sec_uid, cookies, per_page=per_page, max_pages=pages, timeout=timeout
+    ):
+        out.extend(page)
+        if len(out) >= count:
+            break
     return out[:count]
 
 

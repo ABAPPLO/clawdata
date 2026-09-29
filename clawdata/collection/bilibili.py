@@ -22,8 +22,10 @@ import re
 import time
 import urllib.parse
 import urllib.request
+from collections.abc import Iterator
 from typing import Any
 
+from clawdata.core.humanize import random_delay
 from clawdata.core.paths import BILIBILI_COOKIES_PATH
 from clawdata.core.session import cookie_header, load_cookies
 
@@ -306,25 +308,58 @@ def extract_mid(text: str) -> str:
     return m.group(1)
 
 
+def iter_user_video_pages(
+    mid: str,
+    cookies: dict[str, str] | None = None,
+    page_size: int = 30,
+    max_pages: int = 20,
+    page_delay: tuple[float, float] = (3.0, 8.0),
+) -> Iterator[list[dict[str, Any]]]:
+    """逐页拉取 UP 主投稿列表（wbi 签名，按发布时间倒序）。
+
+    每页 yield {bvid,title,author,created} 列表；取下一页前随机停顿 page_delay 秒，
+    模拟人类翻页节奏。翻到底、返回条数不满一页或达到 max_pages 时停止。
+    调用方 break 后生成器即被丢弃，不会再发请求。
+    """
+    cookies = cookies or load_bilibili_cookies()
+    ps = max(1, min(page_size, 30))
+    seen: set[str] = set()
+    for pn in range(1, max_pages + 1):
+        params: dict[str, Any] = {
+            "mid": mid, "ps": ps, "tid": 0, "pn": pn,
+            "keyword": "", "order": "pubdate", "platform": "web", "web_location": "1550101",
+            "order_avoided": "true",
+        }
+        data = _wbi_get(SPACE_ARC_URL, params, cookies)
+        total = int((data.get("page") or {}).get("count") or 0)
+        vlist = (data.get("list") or {}).get("vlist") or []
+        items: list[dict[str, Any]] = []
+        for v in vlist:
+            bvid = str(v.get("bvid", ""))
+            if not bvid or bvid in seen:
+                continue
+            seen.add(bvid)
+            items.append({
+                "bvid": bvid,
+                "title": _strip_em(v.get("title", "")),
+                "author": str(v.get("author", "")),
+                "created": int(v.get("created", 0) or 0),
+            })
+        yield items
+        if not vlist or len(vlist) < ps or (total and pn * ps >= total):
+            return
+        random_delay(*page_delay)
+
+
 def fetch_user_videos(mid: str, count: int = 30, cookies: dict[str, str] | None = None) -> list[dict[str, Any]]:
     """拉取 UP 主最新作品（wbi 签名），按发布时间倒序。返回 {bvid,title,author,created} 列表。"""
-    cookies = cookies or load_bilibili_cookies()
-    params: dict[str, Any] = {
-        "mid": mid, "ps": min(count, 30), "tid": 0, "pn": 1,
-        "keyword": "", "order": "pubdate", "platform": "web", "web_location": "1550101",
-        "order_avoided": "true",
-    }
-    data = _wbi_get(SPACE_ARC_URL, params, cookies)
-    vlist = (data.get("list") or {}).get("vlist") or []
-    out = []
-    for v in vlist[:count]:
-        out.append({
-            "bvid": str(v.get("bvid", "")),
-            "title": _strip_em(v.get("title", "")),
-            "author": str(v.get("author", "")),
-            "created": int(v.get("created", 0) or 0),
-        })
-    return out
+    out: list[dict[str, Any]] = []
+    max_pages = max(1, -(-max(count, 1) // 30))
+    for page in iter_user_video_pages(mid, cookies=cookies, max_pages=max_pages):
+        out.extend(page)
+        if len(out) >= count:
+            break
+    return out[:count]
 
 
 # ------------------------------------------------------------ CC 字幕

@@ -36,7 +36,7 @@ from clawdata.download.downloader import DownloadConfig, download_items
 from clawdata.core.humanize import QuietHours, random_delay
 from clawdata.core.session import load_cookies
 from clawdata.collection.douyin_hot import fetch_hot_list, normalize as normalize_hot
-from clawdata.collection.account_videos import fetch_account_videos, resolve_sec_uid
+from clawdata.collection.account_videos import iter_account_video_pages, resolve_sec_uid
 
 from clawdata.storage.store import get, history, init, today
 from clawdata.storage.store import list_hotlist_days, load_hotlist_snapshot
@@ -75,6 +75,11 @@ LINKS_THREAD: threading.Thread | None = None
 DIGEST_LOCK = threading.Lock()
 DIGEST_JOB: dict | None = None
 DIGEST_THREAD: threading.Thread | None = None
+
+# 订阅回溯翻页节奏：单次刷新每个订阅最多翻多少页；一页下载完成后、请求下一页前，
+# 随机停顿若干秒，模拟人类「看完一页再往下翻」，避免高频拉取与暴力下载
+SUBSCRIPTION_MAX_PAGES = 20
+SUBSCRIPTION_PAGE_TURN_DELAY = (5.0, 12.0)
 
 
 def _collect_status() -> dict:
@@ -210,7 +215,11 @@ def _subscription_update(job: dict, **changes) -> None:
 
 
 def _update_bilibili_subscription(db: str, job: dict, idx: int, total: int, sub: dict, name: str) -> None:
-    """处理一个 B站 UP 主订阅：拉最新作品、增量下载、刷新检查时间。"""
+    """处理一个 B站 UP 主订阅：逐页拉取作品，本页全部下载完成后才翻下一页。
+
+    某页没有新视频即停止翻页：首次刷新自然向历史回溯（最多 SUBSCRIPTION_MAX_PAGES 页），
+    之后每次刷新通常第一页就追平增量。页间随机停顿见 SUBSCRIPTION_PAGE_TURN_DELAY。
+    """
     from datetime import timedelta
     from clawdata.collection import bilibili as bili_mod
 
@@ -218,40 +227,134 @@ def _update_bilibili_subscription(db: str, job: dict, idx: int, total: int, sub:
                          message=f"({idx}/{total}) 正在检查 B站「{name}」…")
     bcookies = bili_mod.load_bilibili_cookies()
     mid = sub.get("sec_uid") or bili_mod.extract_mid(sub["homepage"])
-    vids = bili_mod.fetch_user_videos(mid, count=30, cookies=bcookies)
     known = store.existing_aweme_ids(db)
-    new = [v for v in vids if v.get("bvid") and v["bvid"] not in known]
     downloaded = 0
-    for v in new:
-        try:
-            info = bili_mod.resolve(v["bvid"], bcookies)
-        except Exception as exc:  # noqa: BLE001
-            _subscription_update(job, message=f"「{name}」解析失败 {v['bvid']}：{exc}")
-            continue
-        account = v.get("author") or name
-        desc = (v.get("title") or v["bvid"])[:30]
-        download_items([{
-            "title": f"[{sub.get('category')}] {account} | {desc}",
-            "author": v.get("author", ""), "aweme_id": v["bvid"],
-            "account": account, "word": f"account:{account}",
-            "url": info["url"], "audio_url": info.get("audio_url", ""),
-            "filename": f"bili_{v['bvid']}_{desc}.mp4",
-            "referer": f"https://space.bilibili.com/{mid}",
-        }], DownloadConfig(
-            outdir="downloads", delay_range=(1.5, 4.0),
-            quiet=QuietHours(dtime(0, 0), dtime(0, 0)), cookies={},
-            store=db, category=sub.get("category") or "订阅UP主",
-            auto_tag_enqueuer=_auto_tag_downloaded,
-        ))
-        downloaded += 1
-        _subscription_update(job, message=f"「{name}」下载新增 {downloaded}/{len(new)}")
+    resolved_account = ""
+    pages = bili_mod.iter_user_video_pages(
+        mid, cookies=bcookies, max_pages=SUBSCRIPTION_MAX_PAGES,
+        page_delay=SUBSCRIPTION_PAGE_TURN_DELAY)
+    for page_no, page in enumerate(pages, start=1):
+        new = [v for v in page if v.get("bvid") and v["bvid"] not in known]
+        if page and not resolved_account:
+            resolved_account = page[0].get("author") or ""
+        if not new:
+            _subscription_update(job, message=f"({idx}/{total}) 「{name}」第 {page_no} 页无新视频，停止翻页")
+            break
+        _subscription_update(job, message=f"({idx}/{total}) 「{name}」第 {page_no} 页：新视频 {len(new)} 条，开始下载…")
+        page_downloaded = 0
+        for v in new:
+            try:
+                info = bili_mod.resolve(v["bvid"], bcookies)
+            except Exception as exc:  # noqa: BLE001
+                _subscription_update(job, message=f"「{name}」解析失败 {v['bvid']}：{exc}")
+                continue
+            account = v.get("author") or name
+            desc = (v.get("title") or v["bvid"])[:30]
+            download_items([{
+                "title": f"[{sub.get('category')}] {account} | {desc}",
+                "author": v.get("author", ""), "aweme_id": v["bvid"],
+                "account": account, "word": f"account:{account}",
+                "url": info["url"], "audio_url": info.get("audio_url", ""),
+                "filename": f"bili_{v['bvid']}_{desc}.mp4",
+                "referer": f"https://space.bilibili.com/{mid}",
+            }], DownloadConfig(
+                outdir="downloads", delay_range=(1.5, 4.0),
+                quiet=QuietHours(dtime(0, 0), dtime(0, 0)), cookies={},
+                store=db, category=sub.get("category") or "订阅UP主",
+                auto_tag_enqueuer=_auto_tag_downloaded,
+            ))
+            downloaded += 1
+            page_downloaded += 1
+            _subscription_update(job, message=f"({idx}/{total}) 「{name}」第 {page_no} 页下载中：本页 {page_downloaded}/{len(new)}")
+        if page_downloaded == 0:
+            # 本页新视频全部解析失败（如充电专属），继续翻页大概率还是失败，先停
+            break
     now = datetime.now()
     interval = max(1, int(sub.get("interval_hours") or 6))
-    resolved_account = (vids[0].get("author") if vids else "") or sub.get("account") or name
     store.update_subscription(db, int(sub["id"]), sec_uid=mid,
         last_checked_at=now.isoformat(timespec="seconds"),
         next_check_at=(now + timedelta(hours=interval)).isoformat(timespec="seconds"),
-        last_new_count=downloaded, error="", account=resolved_account)
+        last_new_count=downloaded, error="",
+        account=resolved_account or sub.get("account") or name)
+    _subscription_update(job, downloaded=job.get("downloaded", 0) + downloaded,
+                         message=f"「{name}」新增 {downloaded} 条")
+
+
+def _update_douyin_subscription(db: str, job: dict, idx: int, total: int,
+                                sub: dict, name: str, cookies: dict) -> None:
+    """处理一个抖音订阅：接口逐页拉取作品，本页全部下载完成后才翻下一页。
+
+    某页没有新视频即停止翻页：首次刷新自然向历史回溯（最多 SUBSCRIPTION_MAX_PAGES 页），
+    之后每次刷新通常第一页就追平增量。接口翻页不可用时回退浏览器采集（仅最新一批，不回溯）。
+    """
+    from datetime import timedelta
+
+    sec_uid = sub.get("sec_uid") or resolve_sec_uid(sub["homepage"], cookies)
+    known = store.existing_aweme_ids(db)
+    downloaded = 0
+    resolved_account = ""
+    label = {"text": f"「{name}」"}
+
+    def _download_new(items: list[dict]) -> int:
+        done = 0
+        for v in items:
+            account = v.get("account") or v.get("author") or name
+            desc = (v.get("title") or v.get("aweme_id") or "video")[:30]
+            download_items([{
+                "title": f"[{sub.get('category')}] {account} | {desc}",
+                "author": v.get("author", ""), "aweme_id": v.get("aweme_id", ""),
+                "account": account, "word": f"account:{account}",
+                "category": sub.get("category") or "订阅博主",
+                "url": v["url"],
+                "filename": f"{account}_{v.get('aweme_id')}.mp4",
+                "referer": f"https://www.douyin.com/user/{sec_uid}",
+            }], DownloadConfig(
+                outdir="downloads", delay_range=(1.5, 4.0),
+                quiet=QuietHours(dtime(0, 0), dtime(0, 0)), cookies=cookies,
+                store=db, category=sub.get("category") or "订阅博主",
+                auto_tag_enqueuer=_auto_tag_downloaded,
+            ))
+            done += 1
+            _subscription_update(job, message=f"({idx}/{total}) {label['text']}下载 {done}/{len(items)}")
+        return done
+
+    try:
+        pages = iter_account_video_pages(
+            sec_uid, cookies, per_page=20,
+            max_pages=SUBSCRIPTION_MAX_PAGES,
+            page_delay=SUBSCRIPTION_PAGE_TURN_DELAY)
+        for page_no, page in enumerate(pages, start=1):
+            new = [v for v in page if v.get("aweme_id") and str(v["aweme_id"]) not in known]
+            if page and not resolved_account:
+                resolved_account = str(page[0].get("account") or page[0].get("author") or "")
+            if not new:
+                _subscription_update(job, message=f"({idx}/{total}) 「{name}」第 {page_no} 页无新视频，停止翻页")
+                break
+            label["text"] = f"「{name}」第 {page_no} 页："
+            _subscription_update(job, message=f"({idx}/{total}) 「{name}」第 {page_no} 页：新视频 {len(new)} 条，开始下载…")
+            downloaded += _download_new(new)
+    except Exception:
+        if downloaded:
+            raise  # 已下载过一部分，交回外层记录错误即可，回退反而可能重复下载
+        from clawdata.collection.browser_collect import collect_account_videos
+
+        _subscription_update(job, message=f"({idx}/{total}) 「{name}」接口翻页失败，回退浏览器采集最新一批")
+        vids = collect_account_videos(
+            sec_uid, count=50, headless=True, cookies=cookies,
+            on_progress=lambda m: _subscription_update(job, message=f"({idx}/{total}) {m}"))
+        known = store.existing_aweme_ids(db)
+        new = [v for v in vids if v.get("aweme_id") and str(v["aweme_id"]) not in known]
+        label["text"] = f"「{name}」浏览器回退："
+        downloaded = _download_new(new)
+        if vids and not resolved_account:
+            resolved_account = str(vids[0].get("account") or vids[0].get("author") or "")
+    now = datetime.now()
+    interval = max(1, int(sub.get("interval_hours") or 6))
+    store.update_subscription(db, int(sub["id"]), sec_uid=sec_uid,
+        last_checked_at=now.isoformat(timespec="seconds"),
+        next_check_at=(now + timedelta(hours=interval)).isoformat(timespec="seconds"),
+        last_new_count=downloaded, error="",
+        account=resolved_account or sub.get("account") or name)
     _subscription_update(job, downloaded=job.get("downloaded", 0) + downloaded,
                          message=f"「{name}」新增 {downloaded} 条")
 
@@ -273,52 +376,8 @@ def _subscription_worker(target_id: int = 0) -> None:
 
                 if bili_mod.is_space_url(sub["homepage"]):
                     _update_bilibili_subscription(db, job, idx, len(subs), sub, name)
-                    continue
-
-                sec_uid = sub.get("sec_uid") or resolve_sec_uid(sub["homepage"], cookies)
-                vids = []
-                try:
-                    from clawdata.collection.browser_collect import collect_account_videos
-                    vids = collect_account_videos(sec_uid, count=50, headless=True, cookies=cookies,
-                                                  on_progress=lambda m: _subscription_update(job, message=f"({idx}/{len(subs)}) {m}"))
-                except Exception:
-                    vids = []
-                if not vids:
-                    vids = fetch_account_videos(sec_uid, cookies, count=50)
-                known = store.existing_aweme_ids(db)
-                new = [v for v in vids if v.get("aweme_id") and str(v["aweme_id"]) not in known]
-                for v in new:
-                    account = v.get("account") or v.get("author") or name
-                    desc = (v.get("title") or v.get("aweme_id") or "video")[:30]
-                    download_items([{
-                        "title": f"[{sub.get('category')}] {account} | {desc}",
-                        "author": v.get("author", ""), "aweme_id": v.get("aweme_id", ""),
-                        "account": account, "word": f"account:{account}",
-                        "category": sub.get("category") or "订阅博主",
-                        "url": v["url"],
-                        "filename": f"{account}_{v.get('aweme_id')}.mp4",
-                        "referer": f"https://www.douyin.com/user/{sec_uid}",
-                    }], DownloadConfig(
-                        outdir="downloads", delay_range=(1.5, 4.0),
-                        quiet=QuietHours(dtime(0, 0), dtime(0, 0)), cookies=cookies,
-                        store=db, category=sub.get("category") or "订阅博主",
-                        auto_tag_enqueuer=_auto_tag_downloaded,
-                    ))
-                now = datetime.now()
-                interval = max(1, int(sub.get("interval_hours") or 6))
-                from datetime import timedelta
-                resolved_account = ""
-                for v in vids:
-                    resolved_account = str(v.get("account") or v.get("author") or "")
-                    if resolved_account:
-                        break
-                store.update_subscription(db, int(sub["id"]), sec_uid=sec_uid,
-                    last_checked_at=now.isoformat(timespec="seconds"),
-                    next_check_at=(now + timedelta(hours=interval)).isoformat(timespec="seconds"),
-                    last_new_count=len(new), error="",
-                    account=resolved_account or sub.get("account") or name)
-                _subscription_update(job, downloaded=job.get("downloaded", 0) + len(new),
-                                     message=f"「{name}」新增 {len(new)} 条")
+                else:
+                    _update_douyin_subscription(db, job, idx, len(subs), sub, name, cookies)
             except Exception as exc:
                 from datetime import timedelta
                 store.update_subscription(db, int(sub["id"]),
