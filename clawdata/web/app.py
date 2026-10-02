@@ -916,7 +916,10 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as e:  # noqa: BLE001
                     ok = False
                     providers = [str(e)[:120]]
-            self._json({"ok": ok, "model": model, "exists": ok, "providers": providers})
+            self._json({
+                "ok": ok, "model": model, "exists": ok, "providers": providers,
+                "auto_download": bool(cfg.get("auto_download_model", True)),
+            })
         elif path == "/api/tools/action/export":
             self._export_action(qs)
         elif path == "/api/tools/sources":
@@ -1800,7 +1803,9 @@ def main(argv: list[str] | None = None) -> int:
         for ip in sorted(lan_ips):
             print(f"局域网访问：http://{ip}:{args.port}")
     print(f"打标签服务：{TAG_CONFIG.get('server')}（{WORKER.status().get('queued', [])} 个任务排队中）")
-    print(f"连续动作拆分：姿态模型 {'就绪' if tools_filter.load_tool_config().get('model_path') else '缺失'}")
+    _model_path = tools_filter.load_tool_config().get("model_path") or ""
+    _model_ok = bool(_model_path) and os.path.isfile(_model_path)
+    print(f"连续动作拆分：姿态模型 {'就绪' if _model_ok else '缺失（首次使用时自动下载）'}")
     print("按 Ctrl+C 停止")
     try:
         server.serve_forever()

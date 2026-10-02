@@ -1563,6 +1563,7 @@
     async function checkEngineAction(){
       const res = await (await fetch('/api/tools/action/model')).json();
       if (res.ok) alert(`引擎就绪（${(res.providers&&res.providers[0])||'ONNX'}）`);
+      else if (res.auto_download) alert('姿态模型尚未下载（约13MB），首次执行连续动作筛选时会自动下载；也可手动放到 models/yolov8n-pose.onnx');
       else alert(`引擎不可用：${res.model||'未找到姿态模型'}`);
     }
 

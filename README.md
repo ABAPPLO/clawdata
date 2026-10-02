@@ -70,11 +70,13 @@ python -m venv .venv
 python -m pip install -r requirements.txt
 ```
 
-连续动作筛选需要把标准 YOLOv8n-pose ONNX 模型放到：
+连续动作筛选需要标准 YOLOv8n-pose ONNX 模型（约 13MB），放在：
 
 ```text
 models/yolov8n-pose.onnx
 ```
+
+文件缺失时会在首次使用连续动作筛选时**自动下载**（镜像依次尝试 hf-mirror.com 与 huggingface.co，需要外网可达；内网机器可先手动放置）。自动下载的模型输入为 640x640，本地手动导出的通常为 320x320，两者都能用，程序会按模型声明自适应。不想要自动下载可在 `config/tools.json` 里设 `"auto_download_model": false`。
 
 ## 配置登录态
 

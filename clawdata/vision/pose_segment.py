@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import urllib.request
 from typing import Any
 
 import cv2
@@ -23,6 +25,16 @@ import numpy as np
 import onnxruntime as ort
 
 from clawdata.core.paths import MODEL_PATH, PROJECT_ROOT, SEGMENTS_DIR
+
+
+# 模型缺失时的公开镜像（依次尝试）。均为标准 ultralytics 导出的 yolov8n-pose ONNX，
+# 输入 640x640；本地手动导出的模型通常是 320x320，_load_model 会按模型声明自适应。
+MODEL_DOWNLOAD_URLS = [
+    "https://hf-mirror.com/Xenova/yolov8-pose-onnx/resolve/main/yolov8n-pose.onnx",
+    "https://huggingface.co/Xenova/yolov8-pose-onnx/resolve/main/yolov8n-pose.onnx",
+]
+_MODEL_MIN_BYTES = 10 * 1024 * 1024
+_MODEL_DL_LOCK = threading.Lock()
 
 
 COCO_KEYPOINTS = [
@@ -46,6 +58,7 @@ POSESEG_DEFAULTS = {
     "max_segments": 20,         # 最多保留的段数
     "top_k": 3,                 # 取最长的几段
     "extract_clips": True,      # 是否把 top 段导出成 mp4
+    "auto_download_model": True,  # 模型文件缺失时自动从镜像下载
 }
 
 
@@ -59,16 +72,66 @@ def merge_pose_config(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
 
 
 # ------------------------------------------------------------------ inference
+def ensure_model(path: str = MODEL_PATH, timeout: float = 300.0) -> str:
+    """模型缺失时自动下载（约 13MB），成功返回路径，失败抛 FileNotFoundError。
+
+    下载到 .part 再原子改名，并用 onnxruntime 试加载校验完整性；多线程共用
+    一把锁，避免队列与面板并发触发重复下载。
+    """
+    if os.path.isfile(path):
+        return path
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with _MODEL_DL_LOCK:
+        if os.path.isfile(path):  # 等锁期间别的线程已下好
+            return path
+        part = path + ".part"
+        last_err: Exception | None = None
+        for url in MODEL_DOWNLOAD_URLS:
+            try:
+                print(f"姿态模型缺失，开始下载：{url}")
+                req = urllib.request.Request(url, headers={"User-Agent": "clawdata/1.0"})
+                with urllib.request.urlopen(req, timeout=timeout) as resp, open(part, "wb") as f:
+                    while True:
+                        chunk = resp.read(1024 * 256)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                if os.path.getsize(part) < _MODEL_MIN_BYTES:
+                    raise RuntimeError("下载的模型文件大小异常")
+                ort.InferenceSession(part, providers=["CPUExecutionProvider"])  # 试加载校验
+                os.replace(part, path)
+                print(f"姿态模型下载完成：{path}")
+                return path
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+                try:
+                    os.remove(part)
+                except OSError:
+                    pass
+                print(f"姿态模型下载失败（{url}）：{exc}")
+        raise FileNotFoundError(
+            f"找不到姿态检测模型且自动下载失败：{path}。"
+            f"请手动下载 yolov8n-pose.onnx 放到该路径（最后错误：{last_err}）"
+        )
+
+
 def _load_model(cfg: dict[str, Any]) -> ort.InferenceSession:
     path = cfg["model_path"]
     if not os.path.isfile(path):
-        raise FileNotFoundError(f"找不到姿态检测模型：{path}")
+        if not cfg.get("auto_download_model", True):
+            raise FileNotFoundError(f"找不到姿态检测模型：{path}")
+        ensure_model(path)
     # 若显式指定了 provider，则优先使用；否则用 CPU（兼顾兼容性）
     providers = cfg.get("providers")
     if not providers:
         available = ort.get_available_providers()
         providers = ["CPUExecutionProvider"] if "CPUExecutionProvider" in available else available
-    return ort.InferenceSession(path, providers=providers)
+    session = ort.InferenceSession(path, providers=providers)
+    # 镜像下载的模型输入是 640x640、本地导出的常是 320x320；动态轴导出则保持配置值
+    dims = session.get_inputs()[0].shape
+    if len(dims) == 4 and isinstance(dims[2], int) and dims[2] > 0:
+        cfg["img_size"] = dims[2]
+    return session
 
 
 def _letterbox(img: np.ndarray, size: int):
@@ -200,12 +263,12 @@ def descriptor_from_image(image_bytes: bytes, cfg: dict[str, Any] | None = None)
     image = cv2.imdecode(data, cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError("无法解析图片，请使用 jpg/png/webp")
+    session = _load_model(cfg)  # 先加载：会按模型输入尺寸修正 cfg["img_size"]
     canvas, _, _, _ = _letterbox(image, cfg["img_size"])
     blob = cv2.dnn.blobFromImage(
         canvas, 1 / 255.0, (cfg["img_size"], cfg["img_size"]),
         (0, 0, 0), swapRB=True,
     ).astype(np.float32)
-    session = _load_model(cfg)
     outputs = session.run(None, {session.get_inputs()[0].name: blob})
     detections = _postprocess(outputs, cfg)
     if not detections:
@@ -233,12 +296,12 @@ def descriptor_from_video_time(
         ok, frame = cap.read()
         if not ok or frame is None:
             return None
+        session = _load_model(cfg)  # 先加载：会按模型输入尺寸修正 cfg["img_size"]
         canvas, _, _, _ = _letterbox(frame, cfg["img_size"])
         blob = cv2.dnn.blobFromImage(
             canvas, 1 / 255.0, (cfg["img_size"], cfg["img_size"]),
             (0, 0, 0), swapRB=True,
         ).astype(np.float32)
-        session = _load_model(cfg)
         outputs = session.run(None, {session.get_inputs()[0].name: blob})
         detections = _postprocess(outputs, cfg)
         if not detections:
