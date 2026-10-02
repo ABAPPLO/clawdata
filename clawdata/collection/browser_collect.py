@@ -8,13 +8,16 @@
 - 注入登录 Cookie，加载 https://www.douyin.com/hot
 - 拦截 channel/hotspot 响应，提取热点视频（作者/标题/直链下载地址）
 
-依赖：playwright（python）+ 系统 Edge；运行 `pip install playwright gmssl`
-(Playwright 可通过 Edge，无需 download 浏览器)。
+依赖：playwright（python）+ 系统已装的 Edge/Chrome（自动探测，或用环境变量
+CLAWDATA_BROWSER 指定）；运行 `pip install playwright gmssl`
+(Playwright 可通过系统浏览器驱动，无需 download 浏览器内核)。
 """
 
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import time
 import urllib.parse
 from typing import Any, Callable
@@ -22,7 +25,41 @@ from typing import Any, Callable
 from clawdata.core.session import load_cookies
 
 
-DEFAULT_EDGE = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+# 浏览器采集复用本机已装的 Edge/Chrome；跨 Windows/Linux 按候选路径依次探测，
+# 也可用环境变量 CLAWDATA_BROWSER 显式指定可执行文件。
+BROWSER_CANDIDATES = [
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    "/usr/bin/microsoft-edge",
+    "/usr/bin/microsoft-edge-stable",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/snap/bin/chromium",
+]
+
+
+def resolve_browser_path() -> str | None:
+    """返回本机可用的浏览器可执行文件（Edge/Chrome），找不到返回 None。"""
+    env = os.environ.get("CLAWDATA_BROWSER", "").strip()
+    if env and os.path.isfile(env):
+        return env
+    for p in BROWSER_CANDIDATES:
+        if os.path.isfile(p):
+            return p
+    return (
+        shutil.which("microsoft-edge")
+        or shutil.which("microsoft-edge-stable")
+        or shutil.which("google-chrome")
+        or shutil.which("google-chrome-stable")
+        or shutil.which("chromium")
+        or shutil.which("chromium-browser")
+    )
+
+
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0"
@@ -43,7 +80,7 @@ def collect_hot(
     from playwright.sync_api import sync_playwright  # 延迟导入
 
     cookies = cookies or load_cookies()
-    edge_path = edge_path or DEFAULT_EDGE
+    edge_path = edge_path or resolve_browser_path()
     captured: list[tuple[str, str]] = []
 
     def log(msg: str) -> None:
@@ -133,7 +170,7 @@ def search_videos_manual(
     from playwright.sync_api import sync_playwright
 
     cookies = cookies or load_cookies()
-    edge_path = edge_path or DEFAULT_EDGE
+    edge_path = edge_path or resolve_browser_path()
     captured: list[tuple[str, str]] = []
 
     def log(msg: str) -> None:
@@ -263,7 +300,7 @@ def search_videos_auto(
     from playwright.sync_api import sync_playwright  # 延迟导入
 
     cookies = cookies or load_cookies()
-    edge_path = edge_path or DEFAULT_EDGE
+    edge_path = edge_path or resolve_browser_path()
     captured: list[tuple[str, str]] = []
 
     def log(msg: str) -> None:
@@ -386,7 +423,7 @@ def collect_account_videos(
     from playwright.sync_api import sync_playwright  # 延迟导入
 
     cookies = cookies or load_cookies()
-    edge_path = edge_path or DEFAULT_EDGE
+    edge_path = edge_path or resolve_browser_path()
     captured: list[tuple[str, str]] = []
 
     def log(msg: str) -> None:

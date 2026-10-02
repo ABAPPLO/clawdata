@@ -66,9 +66,16 @@ clawdata/
 
 ```bash
 python -m venv .venv
-. .venv/Scripts/activate
+. .venv/bin/activate        # Linux/macOS；Windows 是 .venv\Scripts\activate
 python -m pip install -r requirements.txt
 ```
+
+### Ubuntu / Linux 部署说明
+
+- venv 激活路径是 `.venv/bin/activate`（Windows 才是 `.venv/Scripts/activate`）。
+- 浏览器采集（抖音热点/搜索/主页兜底、抖音订阅翻页回退）复用本机 Edge/Chrome，Linux 需自行安装其一，例如 `sudo apt install chromium-browser` 或安装微软 Edge 的 .deb 包；非标准路径可用环境变量 `CLAWDATA_BROWSER` 指定可执行文件。
+- `run_nightly.bat` 和 `start_dashboard.bat` 是 Windows 脚本，Linux 用等价命令：面板 `python -m clawdata.web --port 8000 --host 0.0.0.0`；夜间热榜 `python -m clawdata --hot-list-only --logfile logs/nightly.log`（可配 crontab）。
+- 防火墙放行：`sudo ufw allow 8000/tcp`（Windows 用 netsh，见下文）。
 
 连续动作筛选需要标准 YOLOv8n-pose ONNX 模型（约 13MB），放在：
 
@@ -174,10 +181,13 @@ http://127.0.0.1:8000
 python -m clawdata.web --port 8000 --host 0.0.0.0
 ```
 
-`start_dashboard.bat` 即局域网模式。启动时会打印本机局域网访问地址；Windows 防火墙需放行对应端口（管理员执行一次）：
+`start_dashboard.bat` 即局域网模式。启动时会打印本机局域网访问地址；防火墙需放行对应端口（放行一次即可）：
 
 ```bash
+# Windows（管理员执行）
 netsh advfirewall firewall add rule name="clawdata-dashboard" dir=in action=allow protocol=TCP localport=8000
+# Ubuntu
+sudo ufw allow 8000/tcp
 ```
 
 面板无鉴权，仅适合在可信局域网内自用，不要暴露到公网。SQLite 已启用 WAL 模式以支持多端并发访问。
