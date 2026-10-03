@@ -362,10 +362,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.transport == "http":
         import uvicorn
+        from mcp.server.transport_security import TransportSecuritySettings
 
         token = _load_token(args.token)
         mcp.settings.host = args.host
         mcp.settings.port = args.port
+        if args.host not in ("127.0.0.1", "localhost", "::1"):
+            # SDK 对回环绑定默认只允许回环 Host 头；绑定 0.0.0.0 时按内网部署处理，
+            # 关闭 DNS 重绑定校验（鉴权由上面的 Bearer Token 层负责）
+            mcp.settings.transport_security = TransportSecuritySettings(
+                enable_dns_rebinding_protection=False)
         app = _auth_asgi(mcp.streamable_http_app(), token)
         print(f"clawdata-mcp http://{'0.0.0.0' if args.host == '0.0.0.0' else args.host}:{args.port}/mcp"
               f"（鉴权：{'Token 已启用' if token else '未启用（内网信任）'}，面板 {API}）")
