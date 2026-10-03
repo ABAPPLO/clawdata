@@ -48,41 +48,57 @@ def _download(url: str, dest: str, timeout: float = 120.0) -> int:
     return size
 
 
-def _pull(source: str, types: list[str], limit: int, dry_run: bool, db_path: str) -> int:
+def pull(source: str, types: list[str], limit: int, db_path: str,
+         dry_run: bool = False,
+         on_progress=None, should_stop=None) -> dict:
+    """从源面板逐资产拉取并导入本机库。返回 {types: {imported, skipped, failed}, error}。
+
+    on_progress(msg) 用于 CLI 打印 / 面板展示进度；should_stop() 返回 True 时提前停。
+    """
+    say = on_progress or (lambda _m: None)
     base = source.rstrip("/")
     stats = {t: {"imported": 0, "skipped": 0, "failed": 0} for t in types}
+    result = {"types": stats, "error": ""}
     for t in types:
-        print(f"=== 拉取 {t}（源 {base}）===")
+        say(f"=== 拉取 {t}（源 {base}）===")
         try:
             known = migrate.existing_ids(db_path, t)
         except Exception as exc:  # noqa: BLE001
-            print(f"读取本地库失败：{exc}")
-            return 1
+            result["error"] = f"读取本地库失败：{exc}"
+            say(result["error"])
+            return result
         after_id, done = 0, 0
         while True:
             if limit and done >= limit:
                 break
+            if should_stop and should_stop():
+                say("已手动停止")
+                return result
             try:
                 data = _http_json(
                     f"{base}/api/migrate/list?type={t}&after_id={after_id}&limit={PAGE}")
             except Exception as exc:  # noqa: BLE001
-                print(f"拉取列表失败：{exc}")
-                return 1
+                result["error"] = f"拉取列表失败（{base} 不可达或非 clawdata 面板）：{exc}"
+                say(result["error"])
+                return result
             items = data.get("items") or []
             if not items:
                 break
             for it in items:
+                if should_stop and should_stop():
+                    say("已手动停止")
+                    return result
                 rid, key = it["id"], it.get("key") or ""
                 after_id = rid
                 title = (it.get("title") or "")[:36]
                 if key in known:
                     stats[t]["skipped"] += 1
-                    print(f"  [跳过] id={rid} {title}（本地已存在）")
+                    say(f"  [跳过] id={rid} {title}（本地已存在）")
                     continue
                 if dry_run:
                     done += 1
                     size_h = f"{int(it.get('size') or 0) / 1e6:.1f}MB" if it.get("size") else "-"
-                    print(f"  [试跑] id={rid} {title}（{size_h}，含文件: {bool(it.get('has_file'))}）")
+                    say(f"  [试跑] id={rid} {title}（{size_h}，含文件: {bool(it.get('has_file'))}）")
                     continue
                 tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
                 tmp.close()
@@ -91,13 +107,13 @@ def _pull(source: str, types: list[str], limit: int, dry_run: bool, db_path: str
                     res = migrate.import_bundle(db_path, tmp.name)
                     if res.get("action") == "skipped":
                         stats[t]["skipped"] += 1
-                        print(f"  [跳过] id={rid} {title}（{res.get('reason')}）")
+                        say(f"  [跳过] id={rid} {title}（{res.get('reason')}）")
                     else:
                         stats[t]["imported"] += 1
-                        print(f"  [导入] id={rid} {title} -> 本地 #{res.get('id')}")
+                        say(f"  [导入] id={rid} {title} -> 本地 #{res.get('id')}")
                 except Exception as exc:  # noqa: BLE001
                     stats[t]["failed"] += 1
-                    print(f"  [失败] id={rid} {title}: {str(exc)[:200]}")
+                    say(f"  [失败] id={rid} {title}: {str(exc)[:200]}")
                 finally:
                     try:
                         os.remove(tmp.name)
@@ -109,9 +125,8 @@ def _pull(source: str, types: list[str], limit: int, dry_run: bool, db_path: str
             if len(items) < PAGE:
                 break
         s = stats[t]
-        print(f"=== {t} 完成：导入 {s['imported']}，跳过 {s['skipped']}，失败 {s['failed']} ===")
-    failed_total = sum(s["failed"] for s in stats.values())
-    return 1 if failed_total else 0
+        say(f"=== {t} 完成：导入 {s['imported']}，跳过 {s['skipped']}，失败 {s['failed']} ===")
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -142,7 +157,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.cmd == "pull":
         types = [migrate._norm_type(x) for x in str(args.type).split(",") if x.strip()]
-        return _pull(args.source, types, args.limit, args.dry_run, args.db)
+        result = pull(args.source, types, args.limit, args.db, dry_run=args.dry_run,
+                      on_progress=print)
+        failed = sum(s["failed"] for s in result["types"].values())
+        return 1 if failed or result.get("error") else 0
     if args.cmd == "import-file":
         res = migrate.import_bundle(args.db, args.zip)
         print(json.dumps(res, ensure_ascii=False))

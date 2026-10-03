@@ -76,6 +76,10 @@ LINKS_THREAD: threading.Thread | None = None
 DIGEST_LOCK = threading.Lock()
 DIGEST_JOB: dict | None = None
 DIGEST_THREAD: threading.Thread | None = None
+# 面板「数据迁移」拉取任务（同一时间只跑一个）
+MIGRATE_LOCK = threading.Lock()
+MIGRATE_JOB: dict | None = None
+MIGRATE_THREAD: threading.Thread | None = None
 
 # 订阅回溯翻页节奏：单次刷新每个订阅最多翻多少页；一页下载完成后、请求下一页前，
 # 随机停顿若干秒，模拟人类「看完一页再往下翻」，避免高频拉取与暴力下载
@@ -415,6 +419,56 @@ def _digest_status() -> dict:
             return {"active": False, "job": None}
         job = {k: v for k, v in DIGEST_JOB.items() if k != "stop"}
         return {"active": job.get("status") == "running", "job": job}
+
+
+def _migrate_status() -> dict:
+    with MIGRATE_LOCK:
+        if not MIGRATE_JOB:
+            return {"active": False, "job": None}
+        job = {k: v for k, v in MIGRATE_JOB.items() if k != "stop"}
+        return {"active": job.get("status") == "running", "job": job}
+
+
+def _migrate_update(job: dict, **changes) -> None:
+    with MIGRATE_LOCK:
+        job.update(changes)
+
+
+def _migrate_worker(source: str, types: list[str], limit: int) -> None:
+    """后台执行「从源面板按资产拉取导入」。"""
+    from clawdata import migrate as migrate_cli
+
+    job = MIGRATE_JOB
+    try:
+        result = migrate_cli.pull(
+            source, types, limit, Handler.db,
+            on_progress=lambda m: _migrate_update(job, message=m),
+            should_stop=lambda: bool(job.get("stop")))
+        failed = sum(s["failed"] for s in result["types"].values())
+        ok = not result.get("error") and not failed
+        _migrate_update(job, status="completed" if ok else "failed", stats=result,
+                        message=result.get("error") or f"迁移完成：失败 {failed} 条",
+                        finished_at=datetime.now().isoformat(timespec="seconds"))
+    except Exception as exc:  # noqa: BLE001
+        _migrate_update(job, status="failed", error=str(exc),
+                        message=f"迁移失败：{exc}",
+                        finished_at=datetime.now().isoformat(timespec="seconds"))
+
+
+def _start_migrate_pull(source: str, types: list[str], limit: int) -> bool:
+    global MIGRATE_JOB, MIGRATE_THREAD
+    with MIGRATE_LOCK:
+        if MIGRATE_JOB and MIGRATE_JOB.get("status") == "running":
+            return False
+        MIGRATE_JOB = {"status": "running", "source": source, "types": types,
+                       "limit": limit, "message": "准备拉取…", "stats": None,
+                       "started_at": datetime.now().isoformat(timespec="seconds"),
+                       "finished_at": ""}
+        MIGRATE_THREAD = threading.Thread(target=_migrate_worker,
+                                          args=(source, types, limit),
+                                          daemon=True, name="migrate-worker")
+        MIGRATE_THREAD.start()
+        return True
 
 
 def _digest_update(job: dict, **changes) -> None:
@@ -1103,6 +1157,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._serve_file(seg)
                 return
             self.send_error(404, "segment not found")
+        elif path == "/api/migrate/pull/status":
+            self._json(_migrate_status())
         elif path == "/api/migrate/list":
             # 迁移源端点：列出可迁移资产（供部署机 python -m clawdata.migrate pull 逐个拉取）
             from clawdata.storage import migrate as migrate_mod
@@ -1371,6 +1427,33 @@ class Handler(BaseHTTPRequestHandler):
                     except OSError:
                         pass
             self._json({"ok": bool(dig_id)})
+        elif path == "/api/migrate/pull":
+            # Web 入口：后台任务方式从源面板逐资产拉取导入，进度走 /api/migrate/pull/status
+            from clawdata.storage import migrate as migrate_mod
+
+            source = str(body.get("source", "")).strip()
+            if not source.startswith(("http://", "https://")):
+                self._json({"ok": False, "error": "源面板地址需以 http:// 开头，如 http://10.168.1.105:8000"}, status=400)
+                return
+            try:
+                types = [migrate_mod._norm_type(x)
+                         for x in str(body.get("type", "downloads,digests")).split(",") if x.strip()]
+            except ValueError as exc:
+                self._json({"ok": False, "error": str(exc)}, status=400)
+                return
+            try:
+                limit = max(0, int(body.get("limit", 0) or 0))
+            except (ValueError, TypeError):
+                limit = 0
+            if not _start_migrate_pull(source, types, limit):
+                self._json({"ok": False, "error": "迁移任务已在运行"}, status=409)
+                return
+            self._json({"ok": True, **_migrate_status()})
+        elif path == "/api/migrate/pull/stop":
+            with MIGRATE_LOCK:
+                if MIGRATE_JOB and MIGRATE_JOB.get("status") == "running":
+                    MIGRATE_JOB["stop"] = True
+            self._json({"ok": True, **_migrate_status()})
         elif path == "/api/migrate/import":
             # 迁移目标端点：接收一个资产包 zip（原始请求体），去重后落库
             from clawdata.storage import migrate as migrate_mod

@@ -251,6 +251,7 @@
         <button id="tabSubscriptions" class="navlink" data-view="subscriptions" onclick="showSubscriptions()"><i>★</i>订阅博主<small>增量</small></button>
         <button id="tabDigest" class="navlink" data-view="digest" onclick="showDigest()"><i>▣</i>视频文库<small>知识</small></button>
         <button id="tabAssets" class="navlink" data-view="assets" onclick="showAssets()"><i>▦</i>资产画廊</button>
+        <button id="tabMigrate" class="navlink" data-view="migrate" onclick="showMigrate()"><i>⇄</i>数据迁移<small>导入</small></button>
       </nav>
       <div class="sidebar-foot">
         <b>操作提示</b>
@@ -694,6 +695,32 @@
         </div>
       </div>
     </div>
+    <div id="viewMigrate" style="display:none">
+      <div class="card">
+        <div class="bar"><b>从其他 clawdata 面板拉取</b><span style="color:var(--mut)">一个文件一个资产 · 按视频 ID 去重 · 中断可续传</span></div>
+        <div class="bar">
+          <input id="migSource" placeholder="源面板地址，如 http://10.168.1.105:8000" style="flex:1; min-width:240px">
+          <select id="migType">
+            <option value="downloads,digests">全部（视频+文库）</option>
+            <option value="downloads">仅下载视频</option>
+            <option value="digests">仅文库文档</option>
+          </select>
+          <input id="migLimit" type="number" min="0" value="0" title="每类最多拉取条数，0=不限" style="width:90px" placeholder="限量">
+          <button class="btn" id="migStartBtn" onclick="startMigratePull()">开始拉取</button>
+          <button class="btn ghost" id="migStopBtn" style="display:none" onclick="stopMigratePull()">停止</button>
+        </div>
+        <div class="bar"><span style="color:var(--mut)">源面板需对本机可达（源机以 <code>--host 0.0.0.0</code> 启动）；已存在的资产自动跳过，重复点「开始拉取」即为续传增量。</span></div>
+        <div id="migStatus" style="margin-top:8px; white-space:pre-wrap; font-size:13px; color:var(--mut); max-height:300px; overflow:auto; border-top:1px solid var(--line); padding-top:8px">尚未开始迁移</div>
+      </div>
+      <div class="card" style="margin-top:12px">
+        <div class="bar"><b>上传资产包导入</b><span style="color:var(--mut)">单个 zip（download_*.zip / digest_*.zip）</span></div>
+        <div class="bar">
+          <input type="file" id="migFile" accept=".zip" style="flex:1">
+          <button class="btn" id="migUploadBtn" onclick="uploadMigrateZip()">导入</button>
+        </div>
+        <div id="migUploadStatus" style="margin-top:8px; font-size:13px; color:var(--mut)">选择 zip 后点「导入」；重复资产会自动跳过。资产包可从源面板 <code>/api/migrate/export?type=&amp;id=</code> 下载。</div>
+      </div>
+    </div>
   </main>
   </div>
   <div id="toasts" class="toast-wrap"></div>
@@ -945,7 +972,8 @@
       tools:{title:'处理工具', eyebrow:'TOOLS', desc:'统一选择原视频或资产视频，配置保存资产名与输出策略后执行。'},
       subscriptions:{title:'订阅博主', eyebrow:'SUBSCRIPTIONS', desc:'定期检查博主主页并下载新增视频，自动进入内容理解队列。'},
       digest:{title:'视频文库', eyebrow:'DIGEST', desc:'拉取订阅博主最新视频，提取简介与字幕中的文档代码信息，AI 整理成可检索、可问询的知识文档。'},
-      assets:{title:'资产画廊', eyebrow:'ASSETS', desc:'按来源类型、来源工具、AI 标签和分类检索下载原片与工具结果。'}
+      assets:{title:'资产画廊', eyebrow:'ASSETS', desc:'按来源类型、来源工具、AI 标签和分类检索下载原片与工具结果。'},
+      migrate:{title:'数据迁移', eyebrow:'MIGRATE', desc:'从其他 clawdata 面板按资产逐个拉取导入（视频 + 文库文档），或直接上传资产包 zip。'}
     };
 
     function toast(message, type='info'){
@@ -972,6 +1000,80 @@
     function showTags(){ showView('tags'); refreshTags(); }
     function showTools(){ showView('tools'); backTools(); refreshTools(); }
     function showAssets(){ showView('assets'); refreshAssets(); }
+
+    /* ============ 数据迁移 ============ */
+    let MIG_POLL=null;
+    function showMigrate(){ showView('migrate'); pollMigrateStatus(); }
+
+    async function startMigratePull(){
+      const source=document.getElementById('migSource').value.trim();
+      if(!source.startsWith('http')){ toast('请填写源面板地址（http://…）','bad'); return; }
+      const body={ source,
+        type: document.getElementById('migType').value,
+        limit: parseInt(document.getElementById('migLimit').value||'0',10)||0 };
+      const r=await fetch('/api/migrate/pull',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      const d=await r.json();
+      if(!d.ok){ toast(d.error||'启动失败','bad'); return; }
+      toast('迁移任务已启动');
+      pollMigrateStatus();
+    }
+
+    async function stopMigratePull(){
+      await fetch('/api/migrate/pull/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+      toast('已请求停止，当前资产完成后停下');
+    }
+
+    function _migStatsText(stats){
+      if(!stats||!stats.types) return '';
+      return Object.entries(stats.types).map(([t,s])=>
+        `${t==='downloads'?'视频':'文库'}：导入 ${s.imported} / 跳过 ${s.skipped} / 失败 ${s.failed}`).join('\n');
+    }
+
+    function renderMigrateJob(d){
+      const el=document.getElementById('migStatus');
+      const startBtn=document.getElementById('migStartBtn'), stopBtn=document.getElementById('migStopBtn');
+      const job=d.job;
+      if(!job){ el.textContent='尚未开始迁移'; startBtn.disabled=false; stopBtn.style.display='none'; return; }
+      startBtn.disabled=d.active; stopBtn.style.display=d.active?'':'none';
+      const head=`【${d.active?'进行中':(job.status==='completed'?'已完成':'失败')}】源 ${job.source||''} · ${job.started_at||''}`;
+      const tail=_migStatsText(job.stats)||job.message||'';
+      el.textContent=head+'\n'+tail+(d.active?'\n（实时进度见下方日志 /api/migrate/pull/status）':'');
+      el.style.color = job.status==='failed' ? 'var(--bad,#ff6b6b)' : 'var(--mut)';
+    }
+
+    function pollMigrateStatus(){
+      if(MIG_POLL) clearInterval(MIG_POLL);
+      const once=async()=>{
+        try{
+          const d=await (await fetch('/api/migrate/pull/status')).json();
+          renderMigrateJob(d);
+          if(!d.active && MIG_POLL){ clearInterval(MIG_POLL); MIG_POLL=null; }
+        }catch(e){ /* 面板刷新中 */ }
+      };
+      once();
+      MIG_POLL=setInterval(once,3000);
+    }
+
+    async function uploadMigrateZip(){
+      const f=document.getElementById('migFile').files[0];
+      const el=document.getElementById('migUploadStatus');
+      if(!f){ toast('请先选择 zip 资产包','bad'); return; }
+      el.textContent=`导入中：${f.name}（${(f.size/1e6).toFixed(1)}MB）…`;
+      try{
+        const r=await fetch('/api/migrate/import',{method:'POST',headers:{'Content-Type':'application/zip'},body:f});
+        const d=await r.json();
+        if(d.ok){
+          el.textContent = d.action==='skipped'
+            ? `已跳过：${d.key}（${d.reason||'目标库已存在'}）`
+            : `已导入：${d.key} → 本地记录 #${d.id} ${d.file||d.doc_path||''}`;
+          toast('导入完成');
+        }else{
+          el.textContent='导入失败：'+(d.error||'未知错误');
+          toast(d.error||'导入失败','bad');
+        }
+      }catch(e){ el.textContent='上传失败：'+e; }
+    }
+
     function showSubscriptions(){ showView('subscriptions'); refreshSubscriptions(); }
     function showDigest(){ showView('digest'); refreshDigestList(); loadDigestOptions(); pollDigestStatus(); }
     function backTools(){
@@ -2495,7 +2597,7 @@
     tickClock(); setInterval(tickClock,1000);
     const initialView=location.hash.slice(1);
     const initialParts=initialView.split('/');
-    if (initialView==='today') showToday(); else if (initialView==='history') showHistory(); else if (initialView==='tags') showTags(); else if (initialParts[0]==='tools') { showTools(); if (initialParts[1]) openTool(initialParts[1]); } else if (initialView==='subscriptions') showSubscriptions(); else if (initialView==='digest') showDigest(); else if (initialView==='assets') showAssets(); else showToday();
+    if (initialView==='today') showToday(); else if (initialView==='history') showHistory(); else if (initialView==='tags') showTags(); else if (initialParts[0]==='tools') { showTools(); if (initialParts[1]) openTool(initialParts[1]); } else if (initialView==='subscriptions') showSubscriptions(); else if (initialView==='digest') showDigest(); else if (initialView==='assets') showAssets(); else if (initialView==='migrate') showMigrate(); else showToday();
     pollCollectStatus();
   </script>
 </body>
