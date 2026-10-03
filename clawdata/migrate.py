@@ -148,6 +148,13 @@ def main(argv: list[str] | None = None) -> int:
     p_imp.add_argument("zip", help="资产包路径")
     p_imp.add_argument("--db", default=DEFAULT_DB_PATH, help="本机库路径")
 
+    p_ado = sub.add_parser("adopt", help="接管整份拷贝过来的文件夹（含 clawdata.db 与 downloads/），合并入本机库")
+    p_ado.add_argument("--from-dir", dest="src", required=True,
+                       help="拷贝过来的文件夹（源项目根 或 只含 data/+downloads/ 的目录）")
+    p_ado.add_argument("--limit", type=int, default=0, help="每类最多处理条数（0=不限）")
+    p_ado.add_argument("--dry-run", action="store_true", help="只列出不落库")
+    p_ado.add_argument("--db", default=DEFAULT_DB_PATH, help="本机库路径")
+
     p_exp = sub.add_parser("export", help="把本机一个资产打成 zip")
     p_exp.add_argument("--type", default="downloads", help="downloads 或 digests")
     p_exp.add_argument("--id", type=int, required=True, help="资产记录 id")
@@ -165,6 +172,11 @@ def main(argv: list[str] | None = None) -> int:
         res = migrate.import_bundle(args.db, args.zip)
         print(json.dumps(res, ensure_ascii=False))
         return 0 if res.get("ok") else 1
+    if args.cmd == "adopt":
+        result = migrate.adopt_folder(args.db, args.src, limit=args.limit,
+                                      dry_run=args.dry_run, on_progress=print)
+        failed = sum(s["failed"] for s in result["types"].values())
+        return 1 if failed or result.get("error") else 0
     info = migrate.build_bundle(args.db, args.type, args.id, args.out)
     print(json.dumps(info, ensure_ascii=False))
     return 0

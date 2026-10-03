@@ -181,7 +181,12 @@ python -m clawdata.migrate pull --from http://<源机IP>:8000                   
 python -m clawdata.migrate pull --from http://<源机IP>:8000                     # 全量 downloads+digests
 python -m clawdata.migrate pull --from http://<源机IP>:8000 --type digests --limit 10 --dry-run
 python -m clawdata.migrate import-file download_59.zip                          # 手动导入单个包
+python -m clawdata.migrate adopt --from-dir /tmp/clawdata_copy --dry-run        # 接管整份拷贝的文件夹
 ```
+
+大批量搬运可用「文件夹接管」：任意方式（scp/rsync/U盘/共享目录）把源机的 `data/`（含 clawdata.db）与
+`downloads/` 整个拷到目标机，再执行 `adopt --from-dir <目录>` 一次合并入库——按视频 ID 去重合并、
+自动修正 Windows/Linux 路径分隔符；拷贝前先停源面板保证 db 是完整快照。
 
 等价 API：`GET /api/migrate/list?type=downloads|digests&after_id=&limit=`（列表）、
 `GET /api/migrate/export?type=&id=`（zip 附件）、`POST /api/migrate/import`（请求体为 zip 二进制）、

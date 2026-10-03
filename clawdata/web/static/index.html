@@ -713,6 +713,16 @@
         <div id="migStatus" style="margin-top:8px; white-space:pre-wrap; font-size:13px; color:var(--mut); max-height:300px; overflow:auto; border-top:1px solid var(--line); padding-top:8px">尚未开始迁移</div>
       </div>
       <div class="card" style="margin-top:12px">
+        <div class="bar"><b>接管整份拷贝的文件夹</b><span style="color:var(--mut)">scp/rsync/U盘 拷来的 data/ + downloads/，一条命令合并入库</span></div>
+        <div class="bar">
+          <input id="migAdoptDir" placeholder="服务器上的文件夹路径，如 /home/applo/clawdata_copy" style="flex:1; min-width:240px">
+          <input id="migAdoptLimit" type="number" min="0" value="0" title="每类最多处理条数，0=不限" style="width:90px" placeholder="限量">
+          <label style="color:var(--mut); font-size:13px"><input type="checkbox" id="migAdoptDry"> 试跑</label>
+          <button class="btn" onclick="startMigrateAdopt()">开始接管</button>
+        </div>
+        <div class="bar"><span style="color:var(--mut)">文件夹应含 <code>clawdata.db</code>（或 <code>data/clawdata.db</code>）与 <code>downloads/</code>；按视频 ID 去重合并到本机库，不会清空已有数据，路径分隔符自动修正。源库拷贝前最好先停源面板。</span></div>
+      </div>
+      <div class="card" style="margin-top:12px">
         <div class="bar"><b>上传资产包导入</b><span style="color:var(--mut)">单个 zip（download_*.zip / digest_*.zip）</span></div>
         <div class="bar">
           <input type="file" id="migFile" accept=".zip" style="flex:1">
@@ -1023,10 +1033,23 @@
       toast('已请求停止，当前资产完成后停下');
     }
 
+    async function startMigrateAdopt(){
+      const path=document.getElementById('migAdoptDir').value.trim();
+      if(!path){ toast('请填写服务器上的文件夹路径','bad'); return; }
+      const body={ path,
+        limit: parseInt(document.getElementById('migAdoptLimit').value||'0',10)||0,
+        dry_run: document.getElementById('migAdoptDry').checked };
+      const r=await fetch('/api/migrate/adopt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      const d=await r.json();
+      if(!d.ok){ toast(d.error||'启动失败','bad'); return; }
+      toast(body.dry_run?'试跑已启动':'接管任务已启动');
+      pollMigrateStatus();
+    }
+
     function _migStatsText(stats){
       if(!stats||!stats.types) return '';
       return Object.entries(stats.types).map(([t,s])=>
-        `${t==='downloads'?'视频':'文库'}：导入 ${s.imported} / 跳过 ${s.skipped} / 失败 ${s.failed}`).join('\n');
+        `${t==='downloads'?'视频':'文库'}：导入 ${s.imported} / 跳过 ${s.skipped} / 失败 ${s.failed}${s.missing_file?` / 缺文件 ${s.missing_file}`:''}`).join('\n');
     }
 
     function renderMigrateJob(d){

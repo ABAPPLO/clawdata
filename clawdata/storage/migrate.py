@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import zipfile
 from datetime import datetime
@@ -175,6 +176,62 @@ def _safe_extract(zf: zipfile.ZipFile, member: str, dest_abs: str) -> None:
             out.write(chunk)
 
 
+def _insert_download_row(db_path: str, row: dict, new_rel: str, size: int) -> int:
+    """插入一条下载记录（保留原始日期/标签），返回新 id。zip 导入与文件夹接管共用。"""
+    cols = ("created_at", "day", "title", "tag_category", "tags", "tag_summary",
+            "tag_status", "tagged_at", "tag_error", "author", "aweme_id", "word",
+            "account", "url", "file", "size", "status")
+    defaults = {"created_at": datetime.now().isoformat(timespec="seconds"),
+                "day": datetime.now().strftime("%Y-%m-%d"),
+                "tag_status": "untagged", "status": "migrated",
+                "tags": "[]", "size": 0}
+    overrides = {"file": new_rel, "size": size,
+                 "status": row.get("status") or "migrated"}
+    values = []
+    for c in cols:
+        v = overrides.get(c)
+        if v is None:
+            v = row.get(c)
+            if v is None or v == "":
+                v = defaults.get(c, "")
+        values.append(v)
+    with _conn(db_path) as conn:
+        conn.execute(
+            f"INSERT INTO downloads ({', '.join(cols)})"
+            " VALUES ({})".format(", ".join("?" * len(cols))),
+            values,
+        )
+        conn.commit()
+        new_id = conn.execute(
+            "SELECT id FROM downloads WHERE aweme_id = ? OR file = ? ORDER BY id DESC LIMIT 1",
+            (row.get("aweme_id") or "", new_rel)).fetchone()
+    return int(new_id[0]) if new_id else 0
+
+
+def _insert_digest_row(db_path: str, row: dict, key: str, doc_rel: str) -> int:
+    """按 aweme_id 插入一条文库记录（已存在则忽略），返回记录 id。"""
+    now = row.get("created_at") or datetime.now().isoformat(timespec="seconds")
+    day = row.get("day") or str(now)[:10]
+    cols = ("created_at", "day", "platform", "aweme_id", "subscription_id", "author",
+            "title", "homepage", "url", "pubdate", "desc_text", "subtitle_text",
+            "links_json", "summary", "key_points_json", "doc_path", "status", "error")
+    with _conn(db_path) as conn:
+        conn.execute(
+            f"INSERT OR IGNORE INTO digests ({', '.join(cols)})"
+            " VALUES ({})".format(", ".join("?" * len(cols))),
+            [now, day, row.get("platform", ""), key,
+             int(row.get("subscription_id") or 0), row.get("author", ""),
+             row.get("title", ""), row.get("homepage", ""), row.get("url", ""),
+             row.get("pubdate", ""), row.get("desc_text", ""),
+             row.get("subtitle_text", ""), row.get("links_json", "[]"),
+             row.get("summary", ""), row.get("key_points_json", "[]"),
+             doc_rel, row.get("status", "done"), row.get("error", "")],
+        )
+        conn.commit()
+        new_row = conn.execute("SELECT id FROM digests WHERE aweme_id = ?", (key,)).fetchone()
+    return int(new_row[0]) if new_row else 0
+
+
 def import_bundle(db_path: str, zip_path: str, root: str = PROJECT_ROOT) -> dict[str, Any]:
     """导入一个资产包：按 key 去重，已存在跳过；写文件 + 落库（保留原始日期/标签）。"""
     with zipfile.ZipFile(zip_path) as zf:
@@ -203,35 +260,9 @@ def import_bundle(db_path: str, zip_path: str, root: str = PROJECT_ROOT) -> dict
                 size = os.path.getsize(os.path.join(root, new_rel))
             else:
                 new_rel, size = rel, int(row.get("size") or 0)
-            cols = ("created_at", "day", "title", "tag_category", "tags", "tag_summary",
-                    "tag_status", "tagged_at", "tag_error", "author", "aweme_id", "word",
-                    "account", "url", "file", "size", "status")
-            defaults = {"created_at": datetime.now().isoformat(timespec="seconds"),
-                        "day": datetime.now().strftime("%Y-%m-%d"),
-                        "tag_status": "untagged", "status": "migrated",
-                        "tags": "[]", "size": 0}
-            overrides = {"file": new_rel, "size": size,
-                         "status": row.get("status") or "migrated"}
-            values = []
-            for c in cols:
-                v = overrides.get(c)
-                if v is None:
-                    v = row.get(c)
-                    if v is None or v == "":
-                        v = defaults.get(c, "")
-                values.append(v)
-            with _conn(db_path) as conn:
-                conn.execute(
-                    f"INSERT INTO downloads ({', '.join(cols)})"
-                    " VALUES ({})".format(", ".join("?" * len(cols))),
-                    values,
-                )
-                conn.commit()
-                new_id = conn.execute(
-                    "SELECT id FROM downloads WHERE aweme_id = ? OR file = ? ORDER BY id DESC LIMIT 1",
-                    (key, new_rel)).fetchone()
+            new_id = _insert_download_row(db_path, row, new_rel, size)
             return {"ok": True, "action": "imported", "type": t, "key": key,
-                    "id": int(new_id[0]) if new_id else 0, "file": new_rel}
+                    "id": new_id, "file": new_rel}
         # digests
         doc_rel = ""
         if meta.get("payload") in names:
@@ -240,24 +271,126 @@ def import_bundle(db_path: str, zip_path: str, root: str = PROJECT_ROOT) -> dict
             doc_name = f"{row.get('platform', 'video')}_{key}.md"
             doc_rel = os.path.relpath(os.path.join(digest_dir, doc_name), root)
             _safe_extract(zf, meta["payload"], os.path.join(digest_dir, doc_name))
-        now = row.get("created_at") or datetime.now().isoformat(timespec="seconds")
-        day = row.get("day") or str(now)[:10]
-        cols = ("created_at", "day", "platform", "aweme_id", "subscription_id", "author",
-                "title", "homepage", "url", "pubdate", "desc_text", "subtitle_text",
-                "links_json", "summary", "key_points_json", "doc_path", "status", "error")
-        with _conn(db_path) as conn:
-            conn.execute(
-                f"INSERT OR IGNORE INTO digests ({', '.join(cols)})"
-                " VALUES ({})".format(", ".join("?" * len(cols))),
-                [now, day, row.get("platform", ""), key,
-                 int(row.get("subscription_id") or 0), row.get("author", ""),
-                 row.get("title", ""), row.get("homepage", ""), row.get("url", ""),
-                 row.get("pubdate", ""), row.get("desc_text", ""),
-                 row.get("subtitle_text", ""), row.get("links_json", "[]"),
-                 row.get("summary", ""), row.get("key_points_json", "[]"),
-                 doc_rel, row.get("status", "done"), row.get("error", "")],
-            )
-            conn.commit()
-            new_row = conn.execute("SELECT id FROM digests WHERE aweme_id = ?", (key,)).fetchone()
+        new_id = _insert_digest_row(db_path, row, key, doc_rel)
         return {"ok": True, "action": "imported", "type": t, "key": key,
-                "id": int(new_row[0]) if new_row else 0, "doc_path": doc_rel}
+                "id": new_id, "doc_path": doc_rel}
+
+
+# ------------------------------------------------------------- folder adopt
+
+def _find_in_dir(base: str, names: tuple[str, ...]) -> str:
+    """在 base 下按候选相对路径找第一个存在的文件/目录。"""
+    for n in names:
+        p = os.path.join(base, *n.split("/"))
+        if os.path.exists(p):
+            return p
+    return ""
+
+
+def adopt_folder(db_path: str, src_dir: str, root: str = PROJECT_ROOT,
+                 limit: int = 0, dry_run: bool = False,
+                 on_progress=None, should_stop=None) -> dict[str, Any]:
+    """接管一个「整份拷贝过来的文件夹」：合并其 downloads/digests 全部资产到本机库。
+
+    src_dir 支持两种摆放：
+    - 源项目根目录的拷贝（含 data/clawdata.db 与 downloads/）
+    - 只拷了 data/ 与 downloads/ 两个目录的文件夹（含 clawdata.db 与 downloads/）
+
+    拷贝方式随意（scp/rsync/U盘/共享目录）。按视频 ID 去重合并（不清空本机已有数据），
+    并把库里 Windows 风格的相对路径（downloads\\x.mp4）归一化为本机分隔符。
+    """
+    say = on_progress or (lambda _m: None)
+    src_dir = os.path.abspath(src_dir)
+    if not os.path.isdir(src_dir):
+        raise ValueError(f"目录不存在：{src_dir}")
+    src_db = _find_in_dir(src_dir, ("data/clawdata.db", "clawdata.db"))
+    if not src_db:
+        raise ValueError(f"{src_dir} 下找不到 clawdata.db（应包含 data/clawdata.db 或直接是 clawdata.db）")
+    video_root = _find_in_dir(src_dir, ("downloads", "data/downloads")) or ""
+    doc_root = _find_in_dir(src_dir, ("data/digests", "digests")) or ""
+
+    stats = {"downloads": {"imported": 0, "skipped": 0, "failed": 0, "missing_file": 0},
+             "digests": {"imported": 0, "skipped": 0, "failed": 0, "missing_file": 0}}
+    result = {"src": src_dir, "types": stats, "error": ""}
+    say(f"接管文件夹 {src_dir}（源库 {src_db}）")
+
+    src = sqlite3.connect(f"file:{src_db}?mode=ro", uri=True)
+    src.row_factory = sqlite3.Row
+    try:
+        for t in TYPES:
+            known = existing_ids(db_path, t)
+            done = 0
+            rows = src.execute(
+                f"SELECT * FROM {'downloads' if t == 'downloads' else 'digests'} ORDER BY id")
+            for row in rows:
+                if should_stop and should_stop():
+                    say("已手动停止")
+                    return result
+                if limit and done >= limit:
+                    break
+                row = dict(row)
+                if t == "downloads":
+                    rel = _rel_path(row.get("file", ""), src_dir)
+                    base = os.path.basename(rel) or f"{row.get('aweme_id')}.mp4"
+                    key = str(row.get("aweme_id") or "") or base
+                    if not key or key in known:
+                        stats[t]["skipped"] += 1
+                        continue
+                    done += 1
+                    src_abs = os.path.join(video_root, base) if video_root else ""
+                    local_rel = os.path.join("downloads", base)
+                    title = (row.get("title") or base)[:36]
+                    if dry_run:
+                        say(f"  [试跑] {title}")
+                        continue
+                    try:
+                        size = int(row.get("size") or 0)
+                        local_abs = os.path.join(root, local_rel)
+                        if src_abs and os.path.isfile(src_abs):
+                            os.makedirs(os.path.dirname(local_abs), exist_ok=True)
+                            if not (os.path.isfile(local_abs) and os.path.getsize(local_abs) == os.path.getsize(src_abs)):
+                                shutil.copyfile(src_abs, local_abs)
+                            size = os.path.getsize(local_abs)
+                        else:
+                            stats[t]["missing_file"] += 1
+                        new_id = _insert_download_row(db_path, row, local_rel, size)
+                        known.add(key)
+                        stats[t]["imported"] += 1
+                        say(f"  [导入] {title} -> 本地 #{new_id}")
+                    except Exception as exc:  # noqa: BLE001
+                        stats[t]["failed"] += 1
+                        say(f"  [失败] {title}: {str(exc)[:200]}")
+                else:
+                    key = str(row.get("aweme_id") or "")
+                    if not key or key in known:
+                        stats[t]["skipped"] += 1
+                        continue
+                    done += 1
+                    title = (row.get("title") or key)[:36]
+                    if dry_run:
+                        say(f"  [试跑] 文库 {title}")
+                        continue
+                    try:
+                        doc_name = os.path.basename(_rel_path(row.get("doc_path", ""), src_dir)) \
+                            or f"{row.get('platform', 'video')}_{key}.md"
+                        src_doc = os.path.join(doc_root, doc_name) if doc_root else ""
+                        digest_dir = os.path.join(root, "data", "digests")
+                        os.makedirs(digest_dir, exist_ok=True)
+                        if src_doc and os.path.isfile(src_doc):
+                            shutil.copyfile(src_doc, os.path.join(digest_dir, doc_name))
+                        else:
+                            stats[t]["missing_file"] += 1
+                        doc_rel = os.path.relpath(os.path.join(digest_dir, doc_name), root)
+                        new_id = _insert_digest_row(db_path, row, key, doc_rel)
+                        known.add(key)
+                        stats[t]["imported"] += 1
+                        say(f"  [导入] 文库 {title} -> 本地 #{new_id}")
+                    except Exception as exc:  # noqa: BLE001
+                        stats[t]["failed"] += 1
+                        say(f"  [失败] 文库 {title}: {str(exc)[:200]}")
+            s = stats[t]
+            say(f"=== {t} 完成：导入 {s['imported']}，跳过 {s['skipped']}，"
+                f"缺文件 {s['missing_file']}，失败 {s['failed']} ===")
+    finally:
+        src.close()
+    return result

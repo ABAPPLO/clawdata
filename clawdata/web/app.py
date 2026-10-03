@@ -434,14 +434,11 @@ def _migrate_update(job: dict, **changes) -> None:
         job.update(changes)
 
 
-def _migrate_worker(source: str, types: list[str], limit: int) -> None:
-    """后台执行「从源面板按资产拉取导入」。"""
-    from clawdata import migrate as migrate_cli
-
+def _migrate_worker(desc: str, runner) -> None:
+    """后台执行迁移任务（拉取或文件夹接管），runner 接受 on_progress/should_stop。"""
     job = MIGRATE_JOB
     try:
-        result = migrate_cli.pull(
-            source, types, limit, Handler.db,
+        result = runner(
             on_progress=lambda m: _migrate_update(job, message=m),
             should_stop=lambda: bool(job.get("stop")))
         failed = sum(s["failed"] for s in result["types"].values())
@@ -451,24 +448,43 @@ def _migrate_worker(source: str, types: list[str], limit: int) -> None:
                         finished_at=datetime.now().isoformat(timespec="seconds"))
     except Exception as exc:  # noqa: BLE001
         _migrate_update(job, status="failed", error=str(exc),
-                        message=f"迁移失败：{exc}",
+                        message=f"{desc}失败：{exc}",
                         finished_at=datetime.now().isoformat(timespec="seconds"))
 
 
-def _start_migrate_pull(source: str, types: list[str], limit: int) -> bool:
+def _start_migrate_job(desc: str, runner) -> bool:
     global MIGRATE_JOB, MIGRATE_THREAD
     with MIGRATE_LOCK:
         if MIGRATE_JOB and MIGRATE_JOB.get("status") == "running":
             return False
-        MIGRATE_JOB = {"status": "running", "source": source, "types": types,
-                       "limit": limit, "message": "准备拉取…", "stats": None,
+        MIGRATE_JOB = {"status": "running", "source": desc, "types": [],
+                       "limit": 0, "message": "准备中…", "stats": None,
                        "started_at": datetime.now().isoformat(timespec="seconds"),
                        "finished_at": ""}
         MIGRATE_THREAD = threading.Thread(target=_migrate_worker,
-                                          args=(source, types, limit),
+                                          args=(desc, runner),
                                           daemon=True, name="migrate-worker")
         MIGRATE_THREAD.start()
         return True
+
+
+def _start_migrate_pull(source: str, types: list[str], limit: int) -> bool:
+    from functools import partial
+    from clawdata import migrate as migrate_cli
+
+    return _start_migrate_job(
+        source,
+        partial(migrate_cli.pull, source, types=types, limit=limit, db_path=Handler.db))
+
+
+def _start_migrate_adopt(path: str, limit: int, dry_run: bool) -> bool:
+    from functools import partial
+    from clawdata.storage import migrate as migrate_mod
+
+    return _start_migrate_job(
+        f"文件夹 {path}",
+        partial(migrate_mod.adopt_folder, Handler.db, path,
+                limit=limit, dry_run=dry_run))
 
 
 def _digest_update(job: dict, **changes) -> None:
@@ -1446,6 +1462,20 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, TypeError):
                 limit = 0
             if not _start_migrate_pull(source, types, limit):
+                self._json({"ok": False, "error": "迁移任务已在运行"}, status=409)
+                return
+            self._json({"ok": True, **_migrate_status()})
+        elif path == "/api/migrate/adopt":
+            # Web 入口：接管一个整份拷贝过来的文件夹（data/+downloads/），后台合并入库
+            path_dir = str(body.get("path", "")).strip()
+            if not path_dir or not os.path.isdir(path_dir):
+                self._json({"ok": False, "error": f"目录不存在：{path_dir or '（空）'}"}, status=400)
+                return
+            try:
+                limit = max(0, int(body.get("limit", 0) or 0))
+            except (ValueError, TypeError):
+                limit = 0
+            if not _start_migrate_adopt(path_dir, limit, bool(body.get("dry_run"))):
                 self._json({"ok": False, "error": "迁移任务已在运行"}, status=409)
                 return
             self._json({"ok": True, **_migrate_status()})
