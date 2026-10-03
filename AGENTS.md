@@ -184,7 +184,9 @@ python -m clawdata.migrate import-file download_59.zip                          
 ```
 
 等价 API：`GET /api/migrate/list?type=downloads|digests&after_id=&limit=`（列表）、
-`GET /api/migrate/export?type=&id=`（zip 附件）、`POST /api/migrate/import`（请求体为 zip 二进制）。
+`GET /api/migrate/export?type=&id=`（zip 附件）、`POST /api/migrate/import`（请求体为 zip 二进制）、
+`POST /api/migrate/pull`（后台拉取任务，进度看 `GET /api/migrate/pull/status`）。
+面板左侧「数据迁移」页就是这些能力的 Web 入口：填源面板地址后台拉取，或直接上传 zip 导入。
 导入保留原始日期与 AI 标签；订阅清单不随迁（目标机重新 add），打标/姿态筛选结果可重跑。
 
 ## 注意事项
