@@ -1,7 +1,15 @@
 {
-  "_说明": "ZCode 接入配置。放到 ~/.zcode/cli/config.json（全局）或 <项目>/.zcode/config.json（项目级），与已有 mcp.servers 合并。三选一：A=Windows agent 经 SSH 操作 109 面板；B=agent 直接在 109 上；C=操作本机 Windows 面板。注意 schema 严格，未知字段会导致整个 server 被丢弃。",
+  "_说明": "ZCode 接入配置。放到 ~/.zcode/cli/config.json（全局）或 <项目>/.zcode/config.json（项目级），与已有 mcp.servers 合并。推荐用 clawdata-http（连 109 常驻 MCP 服务，无需 SSH）；stdio 三选一备用。Token 在 109 的 config/mcp.json。注意 schema 严格，未知字段会导致整个 server 被丢弃。",
   "mcp": {
     "servers": {
+      "clawdata-http": {
+        "type": "http",
+        "url": "http://10.168.1.109:8100/mcp",
+        "headers": {
+          "Authorization": "Bearer <TOKEN：ssh 10.168.1.109 cat ~/project/clawdata/config/mcp.json>"
+        },
+        "timeoutMs": 180000
+      },
       "clawdata": {
         "type": "stdio",
         "command": "ssh",

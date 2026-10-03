@@ -196,10 +196,17 @@ python -m clawdata.migrate adopt --from-dir /tmp/clawdata_copy --dry-run        
 
 ## MCP 接入（agent 用工具而非 curl 操作平台）
 
-`python -m clawdata.mcp`（stdio，依赖 `pip install -r requirements-mcp.txt`）把面板 API 包装成 29 个 MCP 工具：
-查询问询（status_overview/digest_list/digest_ask…）、任务启动+轮询（subscription_refresh_start→job_status…）、迁移（migrate_pull_start/migrate_adopt_start…）。
-删除/迁移等危险工具需显式 `confirm=true`。配置模板见 `docs/mcp-zcode.json`（ZCode）与 `docs/mcp-generic.json`（Claude Code/Cursor），
-由 agent 客户端按需拉起进程，不是常驻服务。长任务仍是「启动+轮询」，digest_ask 同步耗时 1~2 分钟。
+部署形态 = Web 面板 + MCP 服务两个常驻单元：`clawdata.service`（:8000 面板/API）与
+`clawdata-mcp.service`（:8100 streamable-http，Bearer Token 在 `config/mcp.json`，健康检查 `GET /`）。
+
+`python -m clawdata.mcp` 把面板 API 包装成 29 个 MCP 工具：查询问询（status_overview/digest_list/digest_ask…）、
+任务启动+轮询（subscription_refresh_start→job_status…）、迁移（migrate_pull_start/migrate_adopt_start…）。
+删除/迁移等危险工具需显式 `confirm=true`。客户端两种接法：
+- HTTP 直连（推荐）：`url = http://<部署机>:8100/mcp` + `Authorization: Bearer <token>`
+- stdio 按需拉起：`python -m clawdata.mcp --api http://127.0.0.1:8000`（依赖 `requirements-mcp.txt`）
+
+配置模板 `docs/mcp-zcode.json`（ZCode）与 `docs/mcp-generic.json`（Claude Code/Cursor）。
+长任务仍是「启动+轮询」，digest_ask 同步耗时 1~2 分钟。
 
 ## 注意事项
 
