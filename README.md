@@ -152,6 +152,18 @@ python -m clawdata.collection.collect_account --account "https://www.douyin.com/
 
 订阅刷新按博主作品列表**逐页**下载：一页视频全部下载完成后，随机停顿数秒再请求下一页，模拟真人浏览节奏，不做高频批量抓取；某页没有新视频即停止翻页。因此首次刷新会自动回溯订阅之前的历史作品（单次上限约 20 页：抖音约 400 条、B 站约 600 条，未追完下次刷新继续），日常增量通常一页内追平。抖音接口翻页不可用时自动回退浏览器采集最新一批。
 
+### 数据迁移到其他机器
+
+部署机换机（如 Windows → Linux）时，不用整库拷贝，按资产逐文件传输：一个 zip 包 = 一条视频（或一篇文库文档）+ 完整元数据，按视频 ID 去重、中断后重跑同一命令即续传。
+
+```bash
+# 源机面板对部署机可达（--host 0.0.0.0 启动）后，在部署机执行：
+python -m clawdata.migrate pull --from http://<源机IP>:8000            # 全量
+python -m clawdata.migrate pull --from http://<源机IP>:8000 --type digests --limit 10 --dry-run
+```
+
+迁移内容为下载视频（含 AI 标签、原始日期）与视频文库文档；订阅清单请在目标机重新添加，cookie 重新登录维护。
+
 ### 整理订阅视频信息（视频文库）
 
 ```bash

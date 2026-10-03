@@ -168,7 +168,24 @@ python -m clawdata.digest --sub 3 --limit 2  # 指定订阅/条数
 python -m clawdata.digest --ask "代码仓库地址是什么"
 python -m clawdata --hot-list-only           # 只刷新热榜
 python -m clawdata.collection.bilibili "https://www.bilibili.com/video/BVxxxx"   # 解析单个B站视频
+python -m clawdata.migrate pull --from http://<源机IP>:8000                     # 从另一台机器按资产拉取迁移
 ```
+
+## 数据迁移（搬到部署机）
+
+按资产逐文件传输：一个 zip 包 = 一条视频（或一篇文库文档）+ 完整元数据；按视频 ID 去重，中断后重跑同一命令即续传。
+
+```bash
+# 源机不用装东西：面板对部署机可达即可（start_dashboard.bat 或 --host 0.0.0.0 启动）
+# 部署机执行：
+python -m clawdata.migrate pull --from http://<源机IP>:8000                     # 全量 downloads+digests
+python -m clawdata.migrate pull --from http://<源机IP>:8000 --type digests --limit 10 --dry-run
+python -m clawdata.migrate import-file download_59.zip                          # 手动导入单个包
+```
+
+等价 API：`GET /api/migrate/list?type=downloads|digests&after_id=&limit=`（列表）、
+`GET /api/migrate/export?type=&id=`（zip 附件）、`POST /api/migrate/import`（请求体为 zip 二进制）。
+导入保留原始日期与 AI 标签；订阅清单不随迁（目标机重新 add），打标/姿态筛选结果可重跑。
 
 ## 注意事项
 

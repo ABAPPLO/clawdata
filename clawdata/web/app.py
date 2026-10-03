@@ -25,6 +25,7 @@ import mimetypes
 import os
 import re
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -664,6 +665,23 @@ class Handler(BaseHTTPRequestHandler):
             f.seek(start)
             self.wfile.write(f.read(length))
 
+    def _send_attachment(self, path: str, filename: str) -> None:
+        """把一个文件作为附件发送（带 Content-Disposition，浏览器/curl 都能拿到文件名）。"""
+        size = os.path.getsize(path)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Length", str(size))
+        self.send_header(
+            "Content-Disposition",
+            f"attachment; filename*=UTF-8''{urllib.parse.quote(filename)}")
+        self.end_headers()
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+
 
     def _read_body(self) -> dict:
         try:
@@ -1085,6 +1103,49 @@ class Handler(BaseHTTPRequestHandler):
                 self._serve_file(seg)
                 return
             self.send_error(404, "segment not found")
+        elif path == "/api/migrate/list":
+            # 迁移源端点：列出可迁移资产（供部署机 python -m clawdata.migrate pull 逐个拉取）
+            from clawdata.storage import migrate as migrate_mod
+
+            try:
+                t = migrate_mod._norm_type(qs.get("type", ["downloads"])[0])
+                after = int(qs.get("after_id", ["0"])[0] or 0)
+                limit = int(qs.get("limit", ["100"])[0] or 100)
+            except (ValueError, TypeError) as exc:
+                self._json({"ok": False, "error": f"参数错误：{exc}"}, status=400)
+                return
+            try:
+                items = migrate_mod.list_items(self.db, t, after_id=after, limit=limit)
+                self._json({"ok": True, "type": t, "count": len(items), "items": items})
+            except Exception as exc:  # noqa: BLE001
+                self._json({"ok": False, "error": str(exc)}, status=500)
+        elif path == "/api/migrate/export":
+            # 迁移源端点：一个资产一个 zip（meta.json + 视频/文档本体）
+            from clawdata.storage import migrate as migrate_mod
+
+            try:
+                t = migrate_mod._norm_type(qs.get("type", ["downloads"])[0])
+                rid = int(qs.get("id", ["0"])[0] or 0)
+            except ValueError as exc:
+                self._json({"ok": False, "error": f"参数错误：{exc}"}, status=400)
+                return
+            if not rid:
+                self._json({"ok": False, "error": "缺少 id"}, status=400)
+                return
+            tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+            tmp.close()
+            try:
+                info = migrate_mod.build_bundle(self.db, t, rid, tmp.name)
+                self._send_attachment(tmp.name, info["filename"])
+            except ValueError as exc:
+                self._json({"ok": False, "error": str(exc)}, status=404)
+            except Exception as exc:  # noqa: BLE001
+                self._json({"ok": False, "error": str(exc)}, status=500)
+            finally:
+                try:
+                    os.remove(tmp.name)
+                except OSError:
+                    pass
         elif path.startswith("/media/"):
             rid = path.rsplit("/", 1)[-1]
             if rid.isdigit():
@@ -1099,7 +1160,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
-        body = self._read_body()
+        # 资产包导入是二进制 zip 请求体，由对应分支自行按字节读取，不能按 JSON 预读
+        body = {} if path == "/api/migrate/import" else self._read_body()
         worker = WORKER
 
         if path == "/api/collect/start":
@@ -1309,6 +1371,40 @@ class Handler(BaseHTTPRequestHandler):
                     except OSError:
                         pass
             self._json({"ok": bool(dig_id)})
+        elif path == "/api/migrate/import":
+            # 迁移目标端点：接收一个资产包 zip（原始请求体），去重后落库
+            from clawdata.storage import migrate as migrate_mod
+
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                length = 0
+            if length <= 0:
+                self._json({"ok": False, "error": "请求体为空（应为 zip 资产包二进制）"}, status=400)
+                return
+            if length > 4 * 1024 * 1024 * 1024:
+                self._json({"ok": False, "error": "资产包超过 4GB 上限"}, status=413)
+                return
+            tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+            tmp.close()
+            try:
+                remaining = length
+                with open(tmp.name, "wb") as out:
+                    while remaining > 0:
+                        chunk = self.rfile.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        remaining -= len(chunk)
+                result = migrate_mod.import_bundle(self.db, tmp.name)
+                self._json(result)
+            except Exception as exc:  # noqa: BLE001
+                self._json({"ok": False, "error": str(exc)[:300]}, status=400)
+            finally:
+                try:
+                    os.remove(tmp.name)
+                except OSError:
+                    pass
         elif path == "/api/digest/config":
             from clawdata.digest import llm as digest_llm
 
