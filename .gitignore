@@ -6,6 +6,7 @@ __pycache__/
 
 config/cookies.json
 config/cookies_bilibili.json
+config/mcp.json
 edge-bilibili-profile/
 *.log
 

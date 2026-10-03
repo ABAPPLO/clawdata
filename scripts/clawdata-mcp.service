@@ -1,0 +1,13 @@
+[Unit]
+Description=clawdata MCP server (streamable-http :8100 -> panel :8000)
+After=network-online.target
+PartOf=clawdata.service
+
+[Service]
+WorkingDirectory=%h/project/clawdata
+ExecStart=%h/project/clawdata/.venv/bin/python -m clawdata.mcp --transport http --host 0.0.0.0 --port 8100 --api http://127.0.0.1:8000
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

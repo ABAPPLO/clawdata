@@ -1,0 +1,4 @@
+{
+  "_说明": "MCP 常驻服务（--transport http）的 Bearer Token。复制为 config/mcp.json 并填入随机串；留空或不建文件 = 不鉴权（仅限可信内网）。",
+  "token": ""
+}

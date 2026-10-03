@@ -1,12 +1,17 @@
 """clawdata MCP 适配器：把面板 HTTP API 暴露为 MCP 工具，供 agent 客户端接入。
 
-形态：**stdio 进程**，由 agent 客户端（ZCode / Claude Code / Cursor 等）在
-mcpServers 配置里声明后按需拉起、会话结束自动退出——不是常驻服务，
-不监听端口。所有工具调用都翻译为对面板现有 HTTP API 的请求，
-面板仍是唯一后端（与网页、curl 完全等价）。
+两种形态：
+- stdio（默认）：由 agent 客户端在 mcpServers 配置里声明后按需拉起，会话结束退出
+- http：常驻服务（部署时与 Web 面板并列，`--transport http`），局域网 agent
+  经 http://<host>:<port>/mcp 直连，可选用 Bearer Token 鉴权（--token /
+  环境变量 CLAWDATA_MCP_TOKEN / config/mcp.json 的 {"token": ...}）
 
-用法（由 MCP 客户端拉起，一般不手动运行）：
-    python -m clawdata.mcp --api http://127.0.0.1:8000
+所有工具调用都翻译为对面板现有 HTTP API 的请求，面板仍是唯一后端
+（与网页、curl 完全等价）。
+
+用法：
+    python -m clawdata.mcp --api http://127.0.0.1:8000                    # stdio
+    python -m clawdata.mcp --transport http --host 0.0.0.0 --port 8100    # 常驻 HTTP
 
 长任务（采集/下载/整理/迁移）遵循「启动 + 轮询」：start 工具立即返回
 任务已启动，agent 用 job_status 轮询（建议 3~4 秒一次）。
@@ -277,12 +282,67 @@ def _build() -> "FastMCP":  # noqa: F821 - 延迟导入后类型仅作注释
     return mcp
 
 
+def _load_token(cli_token: str) -> str:
+    """Token 优先级：命令行 > 环境变量 CLAWDATA_MCP_TOKEN > config/mcp.json。空=不鉴权。"""
+    if cli_token:
+        return cli_token
+    import os
+
+    env = os.environ.get("CLAWDATA_MCP_TOKEN", "")
+    if env:
+        return env
+    try:
+        from clawdata.core.paths import CONFIG_DIR
+
+        cfg_path = os.path.join(CONFIG_DIR, "mcp.json")
+        if os.path.isfile(cfg_path):
+            with open(cfg_path, encoding="utf-8") as f:
+                return str(json.load(f).get("token") or "")
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _auth_asgi(app, token: str):
+    """给 streamable-http 的 ASGI 应用包一层 Bearer Token 校验 + 根路径健康检查。"""
+
+    async def wrapped(scope, receive, send):
+        if scope["type"] != "http":
+            await app(scope, receive, send)
+            return
+        path = scope.get("path", "/")
+        if path == "/" :
+            body = b'{"ok":true,"service":"clawdata-mcp"}'
+            await send({"type": "http.response.start", "status": 200,
+                        "headers": [(b"content-type", b"application/json")]})
+            await send({"type": "http.response.body", "body": body})
+            return
+        if token:
+            headers = {k.decode("latin1").lower(): v.decode("latin1")
+                       for k, v in scope.get("headers", [])}
+            if headers.get("authorization") != f"Bearer {token}":
+                body = b'{"error":"unauthorized"}'
+                await send({"type": "http.response.start", "status": 401,
+                            "headers": [(b"content-type", b"application/json"),
+                                        (b"www-authenticate", b"Bearer")]})
+                await send({"type": "http.response.body", "body": body})
+                return
+        await app(scope, receive, send)
+
+    return wrapped
+
+
 def main(argv: list[str] | None = None) -> int:
     global API
     parser = argparse.ArgumentParser(
         prog="python -m clawdata.mcp",
-        description="clawdata MCP 适配器（stdio）：把面板 API 暴露为 MCP 工具")
+        description="clawdata MCP 适配器：把面板 API 暴露为 MCP 工具（stdio 或常驻 HTTP）")
     parser.add_argument("--api", default=API, help="面板地址（默认 http://127.0.0.1:8000）")
+    parser.add_argument("--transport", choices=("stdio", "http"), default="stdio",
+                        help="stdio=客户端按需拉起；http=常驻服务（部署形态）")
+    parser.add_argument("--host", default="127.0.0.1", help="HTTP 模式绑定地址（如 0.0.0.0）")
+    parser.add_argument("--port", type=int, default=8100, help="HTTP 模式端口（默认 8100）")
+    parser.add_argument("--token", default="", help="HTTP 模式 Bearer Token（空=不鉴权）")
     parser.add_argument("--list-tools", action="store_true",
                         help="调试：列出工具名与描述后退出（不走 MCP 协议）")
     args = parser.parse_args(argv)
@@ -299,6 +359,17 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{t.name}: {desc}")
 
         asyncio.run(_dump())
+        return 0
+    if args.transport == "http":
+        import uvicorn
+
+        token = _load_token(args.token)
+        mcp.settings.host = args.host
+        mcp.settings.port = args.port
+        app = _auth_asgi(mcp.streamable_http_app(), token)
+        print(f"clawdata-mcp http://{'0.0.0.0' if args.host == '0.0.0.0' else args.host}:{args.port}/mcp"
+              f"（鉴权：{'Token 已启用' if token else '未启用（内网信任）'}，面板 {API}）")
+        uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
         return 0
     mcp.run()  # stdio
     return 0
