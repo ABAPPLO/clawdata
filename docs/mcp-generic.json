@@ -1,0 +1,22 @@
+{
+  "_说明": "通用 mcpServers 格式（Claude Code 的 .mcp.json、Cursor 的 .cursor/mcp.json 等）。三选一，字段与 docs/mcp-zcode.json 一致。",
+  "mcpServers": {
+    "clawdata": {
+      "command": "ssh",
+      "args": [
+        "10.168.1.109",
+        "cd ~/project/clawdata && .venv/bin/python -m clawdata.mcp --api http://127.0.0.1:8000"
+      ]
+    },
+    "clawdata-on-109": {
+      "command": "/home/applo/project/clawdata/.venv/bin/python",
+      "args": ["-m", "clawdata.mcp", "--api", "http://127.0.0.1:8000"],
+      "cwd": "/home/applo/project/clawdata"
+    },
+    "clawdata-win": {
+      "command": "D:\\project\\clawdata\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "clawdata.mcp", "--api", "http://127.0.0.1:8000"],
+      "cwd": "D:\\project\\clawdata"
+    }
+  }
+}

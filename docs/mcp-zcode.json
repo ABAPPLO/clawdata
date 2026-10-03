@@ -1,0 +1,30 @@
+{
+  "_说明": "ZCode 接入配置。放到 ~/.zcode/cli/config.json（全局）或 <项目>/.zcode/config.json（项目级），与已有 mcp.servers 合并。三选一：A=Windows agent 经 SSH 操作 109 面板；B=agent 直接在 109 上；C=操作本机 Windows 面板。注意 schema 严格，未知字段会导致整个 server 被丢弃。",
+  "mcp": {
+    "servers": {
+      "clawdata": {
+        "type": "stdio",
+        "command": "ssh",
+        "args": [
+          "10.168.1.109",
+          "cd ~/project/clawdata && .venv/bin/python -m clawdata.mcp --api http://127.0.0.1:8000"
+        ],
+        "timeoutMs": 180000
+      },
+      "clawdata-on-109": {
+        "type": "stdio",
+        "command": "/home/applo/project/clawdata/.venv/bin/python",
+        "args": ["-m", "clawdata.mcp", "--api", "http://127.0.0.1:8000"],
+        "cwd": "/home/applo/project/clawdata",
+        "timeoutMs": 180000
+      },
+      "clawdata-win": {
+        "type": "stdio",
+        "command": "D:\\project\\clawdata\\.venv\\Scripts\\python.exe",
+        "args": ["-m", "clawdata.mcp", "--api", "http://127.0.0.1:8000"],
+        "cwd": "D:\\project\\clawdata",
+        "timeoutMs": 180000
+      }
+    }
+  }
+}

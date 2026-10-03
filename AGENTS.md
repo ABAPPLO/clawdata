@@ -194,6 +194,13 @@ python -m clawdata.migrate adopt --from-dir /tmp/clawdata_copy --dry-run        
 面板左侧「数据迁移」页就是这些能力的 Web 入口：填源面板地址后台拉取，或直接上传 zip 导入。
 导入保留原始日期与 AI 标签；订阅清单不随迁（目标机重新 add），打标/姿态筛选结果可重跑。
 
+## MCP 接入（agent 用工具而非 curl 操作平台）
+
+`python -m clawdata.mcp`（stdio，依赖 `pip install -r requirements-mcp.txt`）把面板 API 包装成 29 个 MCP 工具：
+查询问询（status_overview/digest_list/digest_ask…）、任务启动+轮询（subscription_refresh_start→job_status…）、迁移（migrate_pull_start/migrate_adopt_start…）。
+删除/迁移等危险工具需显式 `confirm=true`。配置模板见 `docs/mcp-zcode.json`（ZCode）与 `docs/mcp-generic.json`（Claude Code/Cursor），
+由 agent 客户端按需拉起进程，不是常驻服务。长任务仍是「启动+轮询」，digest_ask 同步耗时 1~2 分钟。
+
 ## 注意事项
 
 - 面板/API 只绑 `127.0.0.1`。agent 在远端时，用 SSH 端口转发或在项目机器本地执行 curl/CLI。
