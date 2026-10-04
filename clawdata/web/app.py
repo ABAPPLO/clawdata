@@ -764,10 +764,12 @@ class Handler(BaseHTTPRequestHandler):
             pass  # 客户端中断了资产包下载，正常现象
 
 
-    def _proxy_media(self, base: str, rid: str) -> None:
-        """把远端 /media/<id> 流式转发给浏览器：透传 Range（206）与关键响应头，
+    def _proxy_media(self, url: str, token: str = "") -> None:
+        """把远端媒体响应流式转发给浏览器：透传 Range（206）与关键响应头，
         1MB 分块边读边转发，文件不落本机磁盘。"""
-        req = urllib.request.Request(f"{base.rstrip('/')}/media/{rid}")
+        req = urllib.request.Request(url)
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
         range_header = self.headers.get("Range")
         if range_header:
             req.add_header("Range", range_header)
@@ -1225,7 +1227,7 @@ class Handler(BaseHTTPRequestHandler):
             lock = threading.Lock()
 
             def _probe(src):
-                state = remote_mod.source_state(src["base"])
+                state = remote_mod.source_state(src)
                 with lock:
                     states[src["id"]] = state
 
@@ -1237,7 +1239,10 @@ class Handler(BaseHTTPRequestHandler):
                 t.start()
                 threads.append(t)
             for t in threads:
-                t.join(remote_mod.CHECK_TIMEOUT + 1.0)
+                t.join(remote_mod.CHECK_TIMEOUT * 2 + 2.0)
+            for src in sources:  # join 超时仍未返回的源给兜底状态，避免前端缺项
+                if src["enabled"] and src["id"] not in states:
+                    states[src["id"]] = {"reachable": False, "error": "探活超时", "days": 0, "records": 0}
             self._json({"ok": True, "sources": sources, "states": states})
         elif path == "/api/remote/history":
             from clawdata import remote as remote_mod
@@ -1247,7 +1252,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": "源不存在或已停用"}, status=404)
                 return
             try:
-                days = remote_mod.remote_history(src["base"])
+                days = remote_mod.remote_history(src)
             except Exception as exc:  # noqa: BLE001
                 self._json({"ok": False, "error": f"远端不可达：{str(exc)[:160]}"}, status=502)
                 return
@@ -1261,29 +1266,31 @@ class Handler(BaseHTTPRequestHandler):
                 return
             day = qs.get("day", [""])[0].strip()
             q = qs.get("q", [""])[0].strip()
+            kind = qs.get("kind", ["video"])[0].strip() or "video"
             try:
                 limit = max(1, min(int(qs.get("limit", ["200"])[0] or 200), 1000))
             except (ValueError, TypeError):
                 limit = 200
             try:
-                records = remote_mod.remote_records(src["base"], day=day, q=q, limit=limit)
+                records = remote_mod.remote_records(src, day=day, q=q, limit=limit, kind=kind)
             except Exception as exc:  # noqa: BLE001
                 self._json({"ok": False, "error": f"远端不可达：{str(exc)[:160]}"}, status=502)
                 return
             self._json({"ok": True, "source": src, "day": day, "q": q, "count": len(records), "records": records})
         elif path.startswith("/remote-media/"):
-            # 代理播放远端视频：/remote-media/<source_id>/<远端记录id>
+            # 代理播放远端媒体：/remote-media/<source_id>/<远端素材id>
+            # （clawdata 记录 id 为数字；video-share 为 12 位十六进制）
             from clawdata import remote as remote_mod
 
             parts = [p for p in path.split("/") if p]
-            if len(parts) != 3 or not parts[2].isdigit():
+            if len(parts) != 3 or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", parts[2]):
                 self.send_error(404, "not found")
                 return
             src = remote_mod.get_source(parts[1])
             if not src or not src["enabled"]:
                 self.send_error(404, "source not found")
                 return
-            self._proxy_media(src["base"], parts[2])
+            self._proxy_media(remote_mod.media_url(src, parts[2]), src.get("token", ""))
         elif path == "/api/migrate/pull/status":
             self._json(_migrate_status())
         elif path == "/api/migrate/list":
@@ -1630,16 +1637,18 @@ class Handler(BaseHTTPRequestHandler):
                 except OSError:
                     pass
         elif path == "/api/remote/sources":
-            # 添加远程素材源：先探活确认对面是 clawdata 面板，通过才落盘
+            # 添加远程素材源：自动探测类型（clawdata 面板 / video-share 素材库），
+            # 验证可达才落盘；token 可选（video-share 开启鉴权时填）
             from clawdata import remote as remote_mod
 
             name = str(body.get("name", "")).strip()
             base = str(body.get("base", "")).strip()
+            token = str(body.get("token", "")).strip()
             if not base.startswith(("http://", "https://")):
                 self._json({"ok": False, "error": "地址需以 http:// 开头，如 http://10.168.1.105:8000"}, status=400)
                 return
             try:
-                src = remote_mod.add_source(name, base)
+                src = remote_mod.add_source(name, base, token=token)
             except ValueError as exc:
                 self._json({"ok": False, "error": str(exc)[:200]}, status=400)
                 return
@@ -1671,8 +1680,8 @@ class Handler(BaseHTTPRequestHandler):
             remote_mod.save_sources(rest)
             self._json({"ok": True})
         elif path == "/api/remote/pull-one":
-            # 把远端单个资产拉到本机库（迁移 zip 通道，按视频 ID 去重；同步执行，
-            # 大视频视局域网带宽可能需要数十秒，前端按钮置 loading 等待）
+            # 把远端单个素材拉到本机库（clawdata=迁移 zip 通道；video-share=直接下载入库；
+            # 均按去重键跳过已存在。同步执行，大视频视带宽可能数十秒，前端按钮置 loading）
             from clawdata import remote as remote_mod
             from clawdata.storage import migrate as migrate_mod
 
@@ -1682,7 +1691,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 asset_type = migrate_mod._norm_type(str(body.get("type", "downloads")))
-                rid = int(body.get("id") or 0)
+                rid = body.get("id")
+                rid = int(rid) if str(rid).isdigit() else str(rid)
             except (ValueError, TypeError) as exc:
                 self._json({"ok": False, "error": f"参数错误：{exc}"}, status=400)
                 return
@@ -1690,7 +1700,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": "缺少 id"}, status=400)
                 return
             try:
-                result = remote_mod.pull_one(src["base"], asset_type, rid, self.db)
+                result = remote_mod.pull_one(src, rid, asset_type, self.db)
+            except ValueError as exc:
+                self._json({"ok": False, "error": str(exc)[:200]}, status=400)
+                return
             except Exception as exc:  # noqa: BLE001
                 self._json({"ok": False, "error": f"拉取失败：{str(exc)[:200]}"}, status=502)
                 return

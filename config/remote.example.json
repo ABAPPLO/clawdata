@@ -1,11 +1,21 @@
 {
-  "_说明": "远程素材源配置：把局域网内其他 clawdata 面板的素材库接入本机在线浏览/搜索/播放（不复制文件）。复制此文件为 remote.json 后生效，也可直接在面板「远程素材」页添加管理。",
+  "_说明": "远程素材源配置：接入局域网内其他 clawdata 面板或 video-share 素材库，在线浏览/搜索/播放（不复制文件）。复制此文件为 remote.json 后生效，也可直接在面板「远程素材」页添加管理（添加时自动识别类型）。token 仅在远端开启鉴权时填写（video-share --token）。",
   "sources": [
     {
       "id": "s1",
       "name": "105素材库",
       "base": "http://10.168.1.105:8000",
-      "enabled": true
+      "enabled": true,
+      "type": "clawdata",
+      "token": ""
+    },
+    {
+      "id": "s2",
+      "name": "本机素材库",
+      "base": "http://127.0.0.1:8000",
+      "enabled": true,
+      "type": "videoshare",
+      "token": ""
     }
   ]
 }

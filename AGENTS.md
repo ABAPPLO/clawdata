@@ -194,34 +194,38 @@ python -m clawdata.migrate adopt --from-dir /tmp/clawdata_copy --dry-run        
 面板左侧「数据迁移」页就是这些能力的 Web 入口：填源面板地址后台拉取，或直接上传 zip 导入。
 导入保留原始日期与 AI 标签；订阅清单不随迁（目标机重新 add），打标/姿态筛选结果可重跑。
 
-## 远程素材源（把其他面板的素材库当本机的用）
+## 远程素材源（把其他素材库当本机的用）
 
-在面板左侧「远程素材」页填入局域网内另一台 clawdata 面板地址（如 `http://10.168.1.105:8000`，远端需 `--host 0.0.0.0` 启动），即可在线浏览/搜索/播放对方素材库——文件不复制到本机、不占磁盘，远端新增素材立即可见；需要的条目可单条「拉取到本地」（走迁移 zip 通道，按视频 ID 去重）。源清单持久化在 `config/remote.json`，可配多个源。
+在面板左侧「远程素材」页填入远端地址即可在线浏览/搜索/播放对方素材库——文件不复制到本机、不占磁盘，远端新增素材立即可见；需要的条目可单条「拉取到本地」。源清单持久化在 `config/remote.json`，可配多个源。**支持两类源，添加时自动探测**：
+
+- `clawdata`：另一台 clawdata 面板（远端需 `--host 0.0.0.0` 启动）。按天浏览、全库搜索、`/media/<id>` 代理播放；拉取走迁移 zip 通道（按视频 ID 去重）。
+- `videoshare`：video-share 文件素材库（同款服务，零依赖 Node）。目录/搜索浏览（按 mtime 聚合日期）、类型过滤（视频/图片/音频）、`/api/stream` 代理播放；拉取 = 直接下载入库（按 `vs_<hash>` 去重，仅视频）。远端开 `--token` 时添加源填 token。
 
 ```bash
-# 源管理
+# 源管理（token 可选；添加时自动识别 clawdata / videoshare）
 curl http://127.0.0.1:8000/api/remote/sources                       # 清单 + 在线状态（3s 探活）
 curl -X POST http://127.0.0.1:8000/api/remote/sources \
   -H "Content-Type: application/json" \
-  -d '{"name": "105素材库", "base": "http://10.168.1.105:8000"}'    # 添加（先验证对面是 clawdata 面板）
+  -d '{"name": "本机素材库", "base": "http://127.0.0.1:8000", "token": ""}'
 curl -X POST http://127.0.0.1:8000/api/remote/sources/update \
   -H "Content-Type: application/json" -d '{"id": "s1", "enabled": false}'   # 改名/启停
 curl -X POST http://127.0.0.1:8000/api/remote/sources/delete \
   -H "Content-Type: application/json" -d '{"id": "s1"}'                     # 删除（仅移除本机配置）
 
-# 浏览与播放（source 填源 id）
-curl "http://127.0.0.1:8000/api/remote/records?source=s1"                  # 远端最新（今天）
-curl "http://127.0.0.1:8000/api/remote/records?source=s1&q=关键词"         # 远端全库搜索（标题/作者/标签）
-curl "http://127.0.0.1:8000/api/remote/records?source=s1&day=2026-10-04"   # 指定日期
-curl "http://127.0.0.1:8000/api/remote/history?source=s1"                  # 远端按天汇总（日期导航）
-curl "http://127.0.0.1:8000/remote-media/s1/392" -o remote.mp4             # 代理播放/下载远端视频（支持 Range）
+# 浏览与播放（source 填源 id；kind 对 videoshare 生效：video/image/audio/file）
+curl "http://127.0.0.1:8000/api/remote/records?source=s1"                       # 最新（今天）
+curl "http://127.0.0.1:8000/api/remote/records?source=s1&q=关键词"              # 远端全库搜索
+curl "http://127.0.0.1:8000/api/remote/records?source=s1&day=2026-10-04"        # 指定日期
+curl "http://127.0.0.1:8000/api/remote/records?source=s2&kind=image"            # video-share 按类型
+curl "http://127.0.0.1:8000/api/remote/history?source=s1"                       # 按天汇总（日期导航）
+curl "http://127.0.0.1:8000/remote-media/s1/<素材id>" -o remote.mp4             # 代理播放/下载（支持 Range）
 
 # 单条拉取到本机库（同步，大视频视带宽可能数十秒；重复拉取自动跳过）
 curl -X POST http://127.0.0.1:8000/api/remote/pull-one \
   -H "Content-Type: application/json" -d '{"source": "s1", "id": 392}'
 ```
 
-与「数据迁移」的区别：迁移是把资产复制进本机库（离线可用、占磁盘、一次性）；远程源是常驻在线视图（不占磁盘、依赖远端可达、增量即时可见），两者共用同一套 zip 导入通道与去重键。`/remote-media/` 代理只访问远端只读 GET 端点，不会成为远端的写入口。
+记录字段统一为 `{id, title, author, size, created_at, kind, playable, pullable}`（playable=可代理播放，pullable=可拉取入库；clawdata 源恒为 true/true，videoshare 源按素材类型）。与「数据迁移」的区别：迁移是把资产复制进本机库（离线可用、占磁盘、一次性）；远程源是常驻在线视图（不占磁盘、依赖远端可达、增量即时可见）。`/remote-media/` 代理只访问远端只读 GET 端点，不会成为远端的写入口。
 
 ## MCP 接入（agent 用工具而非 curl 操作平台）
 

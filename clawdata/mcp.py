@@ -261,30 +261,34 @@ def _build() -> "FastMCP":  # noqa: F821 - 延迟导入后类型仅作注释
     # ------------------------------------------------------------ 远程素材源
     @mcp.tool()
     def remote_sources_list() -> str:
-        """远程素材源清单与在线状态（已接入的其他 clawdata 面板，浏览/播放不复制文件）。"""
+        """远程素材源清单与在线状态（支持两类源：clawdata 面板 / video-share 素材库；
+        浏览/播放不复制文件）。"""
         return _j(_get("/api/remote/sources"))
 
     @mcp.tool()
-    def remote_records(source: str, day: str = "", q: str = "", limit: int = 50) -> str:
-        """浏览远程源的下载记录：source=源id（见 remote_sources_list）；q=全库搜索
-        （标题/作者/标签）；day=YYYY-MM-DD（缺省=最新）。
-        在线播放地址为 {面板}/remote-media/<source>/<记录id>。"""
+    def remote_records(source: str, day: str = "", q: str = "", kind: str = "video",
+                       limit: int = 50) -> str:
+        """浏览远程源的素材记录：source=源id（见 remote_sources_list）；q=全库搜索；
+        day=YYYY-MM-DD（缺省=最新）；kind 对 video-share 源生效（video/image/audio/file）。
+        在线播放地址为 {面板}/remote-media/<source>/<素材id>。"""
         params = urllib.parse.urlencode({k: v for k, v in
                                          (("source", source), ("day", day), ("q", q),
+                                          ("kind", kind),
                                           ("limit", max(1, min(limit, 200)))) if v})
         data = _get(f"/api/remote/records?{params}")
         if isinstance(data, dict) and isinstance(data.get("records"), list):
             data["records"] = [
-                {k: r.get(k) for k in ("id", "title", "author", "aweme_id", "size",
-                                       "created_at", "tag_category", "tag_status", "file")}
+                {k: r.get(k) for k in ("id", "title", "author", "kind", "size",
+                                       "created_at", "tag_category", "tag_status",
+                                       "file", "playable", "pullable")}
                 for r in data["records"][:max(1, min(limit, 200))]]
         return _j(data)
 
     @mcp.tool()
-    def remote_pull_one(source: str, id: int, type: str = "downloads") -> str:
-        """把远程源单个资产拉取到本机库（迁移 zip 通道，按视频 ID 去重；
-        同步执行，大视频视带宽可能数十秒）。"""
-        return _j(_post("/api/remote/pull-one", {"source": source, "type": type, "id": int(id)},
+    def remote_pull_one(source: str, id, type: str = "downloads") -> str:
+        """把远程源单个素材拉取到本机库（clawdata=迁移 zip 通道；video-share=直接下载，
+        仅视频；按去重键自动跳过已存在）。同步执行，大视频视带宽可能数十秒。"""
+        return _j(_post("/api/remote/pull-one", {"source": source, "type": type, "id": id},
                         timeout=_TIMEOUT_LONG))
 
     # ------------------------------------------------------------ 任务轮询

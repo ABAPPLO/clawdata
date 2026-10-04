@@ -704,15 +704,22 @@
         <div class="bar" style="margin-top:10px">
           <input id="remoteNewName" placeholder="源名称（可选，如 105素材库）" style="min-width:160px">
           <input id="remoteNewBase" placeholder="面板地址，如 http://10.168.1.105:8000" style="flex:1; min-width:240px">
+          <input id="remoteNewToken" placeholder="Token（可选）" style="min-width:110px" title="远端开启鉴权时填写（video-share --token）">
           <button class="btn" id="remoteAddBtn" onclick="addRemoteSource()">添加源</button>
         </div>
-        <div class="bar"><span style="color:var(--mut)">远端需以 <code>--host 0.0.0.0</code> 启动对本机可达；添加时会验证对面是 clawdata 面板。浏览与播放不复制文件，仅「拉取到本地」会占用磁盘。</span></div>
+        <div class="bar"><span style="color:var(--mut)">支持两类源，添加时自动识别：<b>clawdata 面板</b> 与 <b>video-share 素材库</b>。远端需以 <code>--host 0.0.0.0</code> 启动对本机可达；浏览与播放不复制文件，仅「拉取到本地」会占用磁盘。</span></div>
       </div>
       <div class="card" style="margin-top:12px">
         <div class="bar"><b>素材浏览</b><span id="remoteBrowseHint" style="color:var(--mut)">选择源后在线浏览、搜索与播放</span></div>
         <div class="bar">
           <select id="remoteSourceSel" onchange="onRemoteSourceChange()"></select>
           <select id="remoteDaySel" onchange="loadRemoteRecords()"></select>
+          <select id="remoteKindSel" onchange="loadRemoteRecords()" title="素材类型（video-share 源生效）">
+            <option value="video">视频</option>
+            <option value="image">图片</option>
+            <option value="audio">音频</option>
+            <option value="file">全部文件</option>
+          </select>
           <input id="remoteQ" placeholder="搜索标题/作者/标签…" style="flex:1; min-width:200px" onkeydown="if(event.key==='Enter')loadRemoteRecords()">
           <button class="btn" onclick="loadRemoteRecords()">搜索</button>
         </div>
@@ -1052,19 +1059,25 @@
     function renderRemoteSources(){
       document.getElementById('remoteSourceList').innerHTML = REMOTE_SOURCES.length ? REMOTE_SOURCES.map(s=>{
         const st = REMOTE_STATES[s.id]||{};
-        const badge = s.enabled
-          ? (st.reachable ? '<span class="badge ok">在线</span>' : '<span class="badge fail">离线</span>')
-          : '<span class="badge already">停用</span>';
-        const detail = st.reachable ? ` · ${st.records}条 / ${st.days}天` : (st.error ? ` · ${esc(st.error)}` : '');
+        const badge = !s.enabled ? '<span class="badge already">停用</span>'
+          : (st.type_mismatch ? '<span class="badge fail">类型失配</span>'
+          : (st.reachable ? '<span class="badge ok">在线</span>' : '<span class="badge fail">离线</span>'));
+        const typeTag = `<span class="badge already">${s.type==='videoshare'?'video-share':'clawdata'}</span>`;
+        let detail = '';
+        if (st.type_mismatch && st.error){ detail = ` · ${esc(st.error)}`; }
+        else if (st.reachable){
+          detail = ` · ${st.records}条` + (st.days ? ` / ${st.days}天` : '');
+          if (st.detail) detail += ` · ${esc(String(st.detail)).slice(0,48)}`;
+        } else if (st.error){ detail = ` · ${esc(st.error)}`; }
         return `<div class="item">
           <div class="info">
-            <div class="title">${esc(s.name)} ${badge}</div>
+            <div class="title">${esc(s.name)} ${badge} ${typeTag}</div>
             <div class="meta">${esc(s.base)}${detail}</div>
           </div>
           <button class="btn ghost" onclick="toggleRemoteSource('${s.id}', ${!s.enabled})">${s.enabled?'停用':'启用'}</button>
           <button class="btn ghost bad" onclick="deleteRemoteSource('${s.id}')">删除</button>
         </div>`;
-      }).join('') : '<div class="empty">尚未添加远程源——在下方填入另一台 clawdata 面板地址即可把它的素材库接入本机</div>';
+      }).join('') : '<div class="empty">尚未添加远程源——在下方填入另一台 clawdata 面板或 video-share 素材库地址即可接入本机</div>';
       const online = REMOTE_SOURCES.filter(s=>s.enabled && (REMOTE_STATES[s.id]||{}).reachable).length;
       const total = Object.values(REMOTE_STATES).reduce((a,b)=>a+(b.records||0),0);
       document.getElementById('stRemote').innerHTML = `
@@ -1106,10 +1119,10 @@
       <div class="item">
         <div class="info">
           <div class="title">${esc(r.title)||'—'}</div>
-          <div class="meta">${esc(r.author)||'—'}${r.account?` · ${esc(r.account)}`:''} · ${esc(r.word)||'链接'} · ${fmtSize(r.size)} · ${r.created_at||r.day||''}</div>
+          <div class="meta">${esc(r.author)||'—'}${r.kind?` · ${esc(r.kind)}`:''} · ${esc(r.word)||'链接'} · ${fmtSize(r.size)} · ${r.created_at||r.day||''}</div>
         </div>
-        <button class="play" ${r.file?'':'disabled'} onclick="playUrl('/remote-media/${src.id}/${r.id}')">播放</button>
-        <button class="btn ghost" id="rpull-${src.id}-${r.id}" onclick="pullRemoteOne('${src.id}', ${r.id})">拉取到本地</button>
+        ${(r.playable ?? !!r.file) ? `<button class="play" onclick="playUrl('/remote-media/${src.id}/${r.id}')">播放</button>` : ''}
+        ${(r.pullable ?? true) ? `<button class="btn ghost" id="rpull-${src.id}-${r.id}" onclick="pullRemoteOne('${src.id}', '${r.id}')">拉取到本地</button>` : ''}
       </div>`;
 
     async function loadRemoteRecords(){
@@ -1117,10 +1130,11 @@
       if (!REMOTE_CUR){ el.innerHTML='<div class="empty">请先添加并选择远程源</div>'; return; }
       el.innerHTML='<div class="empty">加载中…</div>';
       const day = document.getElementById('remoteDaySel').value || '';
+      const kind = document.getElementById('remoteKindSel').value || 'video';
       const q = document.getElementById('remoteQ').value.trim();
       const src = REMOTE_SOURCES.find(s=>s.id===REMOTE_CUR) || {};
       try{
-        const d = await (await fetch(`/api/remote/records?source=${encodeURIComponent(REMOTE_CUR)}&day=${day}&q=${encodeURIComponent(q)}`)).json();
+        const d = await (await fetch(`/api/remote/records?source=${encodeURIComponent(REMOTE_CUR)}&day=${day}&kind=${kind}&q=${encodeURIComponent(q)}`)).json();
         if (!d.ok){ el.innerHTML=`<div class="empty">${esc(d.error||'加载失败')}</div>`; return; }
         document.getElementById('remoteBrowseHint').textContent =
           `${src.name||''} · ${d.count}条${q?` · 搜“${q}”`:''}${day?` · ${day}`:' · 最新'}`;
@@ -1131,16 +1145,18 @@
     async function addRemoteSource(){
       const name=document.getElementById('remoteNewName').value.trim();
       const base=document.getElementById('remoteNewBase').value.trim();
+      const token=document.getElementById('remoteNewToken').value.trim();
       if(!base.startsWith('http')){ toast('请填写面板地址（http://…）','bad'); return; }
       const btn=document.getElementById('remoteAddBtn');
       btn.disabled=true; btn.textContent='验证中…';
       try{
-        const r=await fetch('/api/remote/sources',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,base})});
+        const r=await fetch('/api/remote/sources',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,base,token})});
         const d=await r.json();
         if(!d.ok){ toast(d.error||'添加失败','bad'); return; }
-        toast('已添加源：'+d.source.name);
+        toast(`已添加源（${d.source.type==='videoshare'?'video-share':'clawdata'}）：${d.source.name}`);
         document.getElementById('remoteNewName').value='';
         document.getElementById('remoteNewBase').value='';
+        document.getElementById('remoteNewToken').value='';
         await loadRemoteSources();
       }catch(e){ toast('添加失败：'+e,'bad'); }
       finally{ btn.disabled=false; btn.textContent='添加源'; }
