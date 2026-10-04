@@ -1,11 +1,18 @@
 {
-  "_说明": "通用 mcpServers 格式（Claude Code 的 .mcp.json、Cursor 的 .cursor/mcp.json 等）。推荐 clawdata-http（连 109 常驻 MCP 服务）；stdio 三选一备用。Token 在 109 的 config/mcp.json。",
+  "_说明": "通用 mcpServers 格式（Claude Code 的 .mcp.json、Cursor 的 .cursor/mcp.json 等）。双机：105=Windows 素材库机，109=Linux 部署机，同一 Token。",
   "mcpServers": {
-    "clawdata-http": {
+    "clawdata-109": {
       "type": "http",
       "url": "http://10.168.1.109:8100/mcp",
       "headers": {
-        "Authorization": "Bearer <TOKEN：ssh 10.168.1.109 cat ~/project/clawdata/config/mcp.json>"
+        "Authorization": "Bearer r_0SRFCeoRJiLSJDCWbhXIoRLGAIGIFj"
+      }
+    },
+    "clawdata-105": {
+      "type": "http",
+      "url": "http://10.168.1.105:8100/mcp",
+      "headers": {
+        "Authorization": "Bearer r_0SRFCeoRJiLSJDCWbhXIoRLGAIGIFj"
       }
     },
     "clawdata": {
