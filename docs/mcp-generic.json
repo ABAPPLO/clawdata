@@ -1,5 +1,5 @@
 {
-  "_说明": "通用 mcpServers 格式（Claude Code 的 .mcp.json、Cursor 的 .cursor/mcp.json 等）。双机：105=Windows 素材库机，109=Linux 部署机，同一 Token。",
+  "_说明": "通用 mcpServers 格式（Claude Code 的 .mcp.json、Cursor 的 .cursor/mcp.json 等）。clawdata-109 = 部署机 clawdata；video-share-105 = 105 素材库机自带 MCP（免 Token）。",
   "mcpServers": {
     "clawdata-109": {
       "type": "http",
@@ -8,12 +8,9 @@
         "Authorization": "Bearer r_0SRFCeoRJiLSJDCWbhXIoRLGAIGIFj"
       }
     },
-    "clawdata-105": {
+    "video-share-105": {
       "type": "http",
-      "url": "http://10.168.1.105:8100/mcp",
-      "headers": {
-        "Authorization": "Bearer r_0SRFCeoRJiLSJDCWbhXIoRLGAIGIFj"
-      }
+      "url": "http://10.168.1.105:8000/mcp"
     },
     "clawdata": {
       "command": "ssh",

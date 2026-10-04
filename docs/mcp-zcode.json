@@ -1,5 +1,5 @@
 {
-  "_说明": "ZCode 双机接入配置（105=Windows 素材库机，109=Linux 部署机，同一 Token）。放到 ~/.zcode/cli/config.json 或 <项目>/.zcode/config.json，与已有 mcp.servers 合并。注意 schema 严格，未知字段会导致整个 server 被丢弃。",
+  "_说明": "ZCode 双源接入配置：clawdata-109 = Linux 部署机 clawdata（面板:8000 + MCP:8100，Token 鉴权）；video-share-105 = 105 素材库机自带的视频素材库 MCP（Node 服务 :8000/mcp，免 Token）。放到 ~/.zcode/cli/config.json 或 <项目>/.zcode/config.json，与已有 mcp.servers 合并。",
   "mcp": {
     "servers": {
       "clawdata-109": {
@@ -10,13 +10,10 @@
         },
         "timeoutMs": 180000
       },
-      "clawdata-105": {
+      "video-share-105": {
         "type": "http",
-        "url": "http://10.168.1.105:8100/mcp",
-        "headers": {
-          "Authorization": "Bearer r_0SRFCeoRJiLSJDCWbhXIoRLGAIGIFj"
-        },
-        "timeoutMs": 180000
+        "url": "http://10.168.1.105:8000/mcp",
+        "timeoutMs": 60000
       },
       "clawdata": {
         "type": "stdio",
