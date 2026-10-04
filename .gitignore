@@ -16,3 +16,4 @@ out/
 edge-debug-profile*/
 models/*.onnx
 
+config/remote.json
