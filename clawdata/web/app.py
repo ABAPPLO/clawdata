@@ -28,7 +28,9 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from datetime import datetime, time as dtime
@@ -686,11 +688,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _json(self, obj, status: int = 200) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (ConnectionError, BrokenPipeError):
+            pass  # 客户端已断开（curl 超时/主动取消等），无需响应也不算错误
 
     def _serve_file(self, path: str, *, cache: bool = False) -> None:
         if not os.path.isfile(path):
@@ -733,25 +738,62 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         with open(path, "rb") as f:
             f.seek(start)
-            self.wfile.write(f.read(length))
+            try:
+                self.wfile.write(f.read(length))
+            except (ConnectionError, BrokenPipeError):
+                pass  # 客户端中途取消（如视频拖进度条），属正常
 
     def _send_attachment(self, path: str, filename: str) -> None:
         """把一个文件作为附件发送（带 Content-Disposition，浏览器/curl 都能拿到文件名）。"""
         size = os.path.getsize(path)
-        self.send_response(200)
-        self.send_header("Content-Type", "application/zip")
-        self.send_header("Content-Length", str(size))
-        self.send_header(
-            "Content-Disposition",
-            f"attachment; filename*=UTF-8''{urllib.parse.quote(filename)}")
-        self.end_headers()
-        with open(path, "rb") as f:
-            while True:
-                chunk = f.read(1024 * 1024)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Length", str(size))
+            self.send_header(
+                "Content-Disposition",
+                f"attachment; filename*=UTF-8''{urllib.parse.quote(filename)}")
+            self.end_headers()
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except (ConnectionError, BrokenPipeError):
+            pass  # 客户端中断了资产包下载，正常现象
 
+
+    def _proxy_media(self, base: str, rid: str) -> None:
+        """把远端 /media/<id> 流式转发给浏览器：透传 Range（206）与关键响应头，
+        1MB 分块边读边转发，文件不落本机磁盘。"""
+        req = urllib.request.Request(f"{base.rstrip('/')}/media/{rid}")
+        range_header = self.headers.get("Range")
+        if range_header:
+            req.add_header("Range", range_header)
+        try:
+            resp = urllib.request.urlopen(req, timeout=30.0)
+        except urllib.error.HTTPError as exc:
+            self.send_error(exc.code, "remote media error")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.send_error(502, f"remote unreachable: {str(exc)[:120]}")
+            return
+        with resp:
+            self.send_response(resp.status)
+            for header in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"):
+                value = resp.headers.get(header)
+                if value:
+                    self.send_header(header, value)
+            self.end_headers()
+            try:
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # 浏览器暂停/关闭播放导致断开，属正常
 
     def _read_body(self) -> dict:
         try:
@@ -1173,6 +1215,75 @@ class Handler(BaseHTTPRequestHandler):
                 self._serve_file(seg)
                 return
             self.send_error(404, "segment not found")
+        elif path == "/api/remote/sources":
+            # 远程素材源清单 + 并发探活（每个源 3s 超时，disabled 直接标停用）
+            from clawdata import remote as remote_mod
+
+            sources = remote_mod.load_sources()
+            states: dict = {}
+            threads = []
+            lock = threading.Lock()
+
+            def _probe(src):
+                state = remote_mod.source_state(src["base"])
+                with lock:
+                    states[src["id"]] = state
+
+            for src in sources:
+                if not src["enabled"]:
+                    states[src["id"]] = {"reachable": False, "error": "已停用", "days": 0, "records": 0}
+                    continue
+                t = threading.Thread(target=_probe, args=(src,), daemon=True)
+                t.start()
+                threads.append(t)
+            for t in threads:
+                t.join(remote_mod.CHECK_TIMEOUT + 1.0)
+            self._json({"ok": True, "sources": sources, "states": states})
+        elif path == "/api/remote/history":
+            from clawdata import remote as remote_mod
+
+            src = remote_mod.get_source(qs.get("source", [""])[0])
+            if not src or not src["enabled"]:
+                self._json({"ok": False, "error": "源不存在或已停用"}, status=404)
+                return
+            try:
+                days = remote_mod.remote_history(src["base"])
+            except Exception as exc:  # noqa: BLE001
+                self._json({"ok": False, "error": f"远端不可达：{str(exc)[:160]}"}, status=502)
+                return
+            self._json({"ok": True, "source": src, "days": days})
+        elif path == "/api/remote/records":
+            from clawdata import remote as remote_mod
+
+            src = remote_mod.get_source(qs.get("source", [""])[0])
+            if not src or not src["enabled"]:
+                self._json({"ok": False, "error": "源不存在或已停用"}, status=404)
+                return
+            day = qs.get("day", [""])[0].strip()
+            q = qs.get("q", [""])[0].strip()
+            try:
+                limit = max(1, min(int(qs.get("limit", ["200"])[0] or 200), 1000))
+            except (ValueError, TypeError):
+                limit = 200
+            try:
+                records = remote_mod.remote_records(src["base"], day=day, q=q, limit=limit)
+            except Exception as exc:  # noqa: BLE001
+                self._json({"ok": False, "error": f"远端不可达：{str(exc)[:160]}"}, status=502)
+                return
+            self._json({"ok": True, "source": src, "day": day, "q": q, "count": len(records), "records": records})
+        elif path.startswith("/remote-media/"):
+            # 代理播放远端视频：/remote-media/<source_id>/<远端记录id>
+            from clawdata import remote as remote_mod
+
+            parts = [p for p in path.split("/") if p]
+            if len(parts) != 3 or not parts[2].isdigit():
+                self.send_error(404, "not found")
+                return
+            src = remote_mod.get_source(parts[1])
+            if not src or not src["enabled"]:
+                self.send_error(404, "source not found")
+                return
+            self._proxy_media(src["base"], parts[2])
         elif path == "/api/migrate/pull/status":
             self._json(_migrate_status())
         elif path == "/api/migrate/list":
@@ -1518,6 +1629,72 @@ class Handler(BaseHTTPRequestHandler):
                     os.remove(tmp.name)
                 except OSError:
                     pass
+        elif path == "/api/remote/sources":
+            # 添加远程素材源：先探活确认对面是 clawdata 面板，通过才落盘
+            from clawdata import remote as remote_mod
+
+            name = str(body.get("name", "")).strip()
+            base = str(body.get("base", "")).strip()
+            if not base.startswith(("http://", "https://")):
+                self._json({"ok": False, "error": "地址需以 http:// 开头，如 http://10.168.1.105:8000"}, status=400)
+                return
+            try:
+                src = remote_mod.add_source(name, base)
+            except ValueError as exc:
+                self._json({"ok": False, "error": str(exc)[:200]}, status=400)
+                return
+            self._json({"ok": True, "source": src})
+        elif path == "/api/remote/sources/update":
+            from clawdata import remote as remote_mod
+
+            sid = str(body.get("id", "")).strip()
+            sources = remote_mod.load_sources()
+            src = next((s for s in sources if s["id"] == sid), None)
+            if not src:
+                self._json({"ok": False, "error": "源不存在"}, status=404)
+                return
+            if "name" in body:
+                src["name"] = str(body["name"]).strip() or src["name"]
+            if "enabled" in body:
+                src["enabled"] = bool(body["enabled"])
+            remote_mod.save_sources(sources)
+            self._json({"ok": True, "source": src})
+        elif path == "/api/remote/sources/delete":
+            from clawdata import remote as remote_mod
+
+            sid = str(body.get("id", "")).strip()
+            sources = remote_mod.load_sources()
+            rest = [s for s in sources if s["id"] != sid]
+            if len(rest) == len(sources):
+                self._json({"ok": False, "error": "源不存在"}, status=404)
+                return
+            remote_mod.save_sources(rest)
+            self._json({"ok": True})
+        elif path == "/api/remote/pull-one":
+            # 把远端单个资产拉到本机库（迁移 zip 通道，按视频 ID 去重；同步执行，
+            # 大视频视局域网带宽可能需要数十秒，前端按钮置 loading 等待）
+            from clawdata import remote as remote_mod
+            from clawdata.storage import migrate as migrate_mod
+
+            src = remote_mod.get_source(str(body.get("source", "")).strip())
+            if not src or not src["enabled"]:
+                self._json({"ok": False, "error": "源不存在或已停用"}, status=404)
+                return
+            try:
+                asset_type = migrate_mod._norm_type(str(body.get("type", "downloads")))
+                rid = int(body.get("id") or 0)
+            except (ValueError, TypeError) as exc:
+                self._json({"ok": False, "error": f"参数错误：{exc}"}, status=400)
+                return
+            if not rid:
+                self._json({"ok": False, "error": "缺少 id"}, status=400)
+                return
+            try:
+                result = remote_mod.pull_one(src["base"], asset_type, rid, self.db)
+            except Exception as exc:  # noqa: BLE001
+                self._json({"ok": False, "error": f"拉取失败：{str(exc)[:200]}"}, status=502)
+                return
+            self._json(result)
         elif path == "/api/digest/config":
             from clawdata.digest import llm as digest_llm
 
@@ -2017,7 +2194,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"连续动作拆分：姿态模型 {'就绪' if _model_ok else '缺失（首次使用时自动下载）'}")
     print("按 Ctrl+C 停止")
     try:
-        server.serve_forever()
+        while True:
+            try:
+                server.serve_forever(poll_interval=0.5)
+            except (ConnectionError, OSError) as exc:
+                # 监听 socket 的瞬时错误（Windows 上防火墙/杀软可能重置连接）不退出
+                print(f"[警告] 主循环 socket 异常，2 秒后继续：{exc}")
+                time.sleep(2)
     except KeyboardInterrupt:
         print("\n已停止")
     return 0

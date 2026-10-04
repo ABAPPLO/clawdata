@@ -194,13 +194,43 @@ python -m clawdata.migrate adopt --from-dir /tmp/clawdata_copy --dry-run        
 面板左侧「数据迁移」页就是这些能力的 Web 入口：填源面板地址后台拉取，或直接上传 zip 导入。
 导入保留原始日期与 AI 标签；订阅清单不随迁（目标机重新 add），打标/姿态筛选结果可重跑。
 
+## 远程素材源（把其他面板的素材库当本机的用）
+
+在面板左侧「远程素材」页填入局域网内另一台 clawdata 面板地址（如 `http://10.168.1.105:8000`，远端需 `--host 0.0.0.0` 启动），即可在线浏览/搜索/播放对方素材库——文件不复制到本机、不占磁盘，远端新增素材立即可见；需要的条目可单条「拉取到本地」（走迁移 zip 通道，按视频 ID 去重）。源清单持久化在 `config/remote.json`，可配多个源。
+
+```bash
+# 源管理
+curl http://127.0.0.1:8000/api/remote/sources                       # 清单 + 在线状态（3s 探活）
+curl -X POST http://127.0.0.1:8000/api/remote/sources \
+  -H "Content-Type: application/json" \
+  -d '{"name": "105素材库", "base": "http://10.168.1.105:8000"}'    # 添加（先验证对面是 clawdata 面板）
+curl -X POST http://127.0.0.1:8000/api/remote/sources/update \
+  -H "Content-Type: application/json" -d '{"id": "s1", "enabled": false}'   # 改名/启停
+curl -X POST http://127.0.0.1:8000/api/remote/sources/delete \
+  -H "Content-Type: application/json" -d '{"id": "s1"}'                     # 删除（仅移除本机配置）
+
+# 浏览与播放（source 填源 id）
+curl "http://127.0.0.1:8000/api/remote/records?source=s1"                  # 远端最新（今天）
+curl "http://127.0.0.1:8000/api/remote/records?source=s1&q=关键词"         # 远端全库搜索（标题/作者/标签）
+curl "http://127.0.0.1:8000/api/remote/records?source=s1&day=2026-10-04"   # 指定日期
+curl "http://127.0.0.1:8000/api/remote/history?source=s1"                  # 远端按天汇总（日期导航）
+curl "http://127.0.0.1:8000/remote-media/s1/392" -o remote.mp4             # 代理播放/下载远端视频（支持 Range）
+
+# 单条拉取到本机库（同步，大视频视带宽可能数十秒；重复拉取自动跳过）
+curl -X POST http://127.0.0.1:8000/api/remote/pull-one \
+  -H "Content-Type: application/json" -d '{"source": "s1", "id": 392}'
+```
+
+与「数据迁移」的区别：迁移是把资产复制进本机库（离线可用、占磁盘、一次性）；远程源是常驻在线视图（不占磁盘、依赖远端可达、增量即时可见），两者共用同一套 zip 导入通道与去重键。`/remote-media/` 代理只访问远端只读 GET 端点，不会成为远端的写入口。
+
 ## MCP 接入（agent 用工具而非 curl 操作平台）
 
 部署形态 = Web 面板 + MCP 服务两个常驻单元：`clawdata.service`（:8000 面板/API）与
 `clawdata-mcp.service`（:8100 streamable-http，Bearer Token 在 `config/mcp.json`，健康检查 `GET /`）。
 
-`python -m clawdata.mcp` 把面板 API 包装成 29 个 MCP 工具：查询问询（status_overview/digest_list/digest_ask…）、
-任务启动+轮询（subscription_refresh_start→job_status…）、迁移（migrate_pull_start/migrate_adopt_start…）。
+`python -m clawdata.mcp` 把面板 API 包装成 32 个 MCP 工具：查询问询（status_overview/digest_list/digest_ask…）、
+任务启动+轮询（subscription_refresh_start→job_status…）、迁移（migrate_pull_start/migrate_adopt_start…）、
+远程素材源（remote_sources_list/remote_records/remote_pull_one…）。
 删除/迁移等危险工具需显式 `confirm=true`。客户端两种接法：
 - HTTP 直连（推荐）：`url = http://<部署机>:8100/mcp` + `Authorization: Bearer <token>`
 - stdio 按需拉起：`python -m clawdata.mcp --api http://127.0.0.1:8000`（依赖 `requirements-mcp.txt`）

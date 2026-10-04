@@ -251,6 +251,7 @@
         <button id="tabSubscriptions" class="navlink" data-view="subscriptions" onclick="showSubscriptions()"><i>★</i>订阅博主<small>增量</small></button>
         <button id="tabDigest" class="navlink" data-view="digest" onclick="showDigest()"><i>▣</i>视频文库<small>知识</small></button>
         <button id="tabAssets" class="navlink" data-view="assets" onclick="showAssets()"><i>▦</i>资产画廊</button>
+        <button id="tabRemote" class="navlink" data-view="remote" onclick="showRemote()"><i>◫</i>远程素材<small>源</small></button>
         <button id="tabMigrate" class="navlink" data-view="migrate" onclick="showMigrate()"><i>⇄</i>数据迁移<small>导入</small></button>
       </nav>
       <div class="sidebar-foot">
@@ -695,6 +696,29 @@
         </div>
       </div>
     </div>
+    <div id="viewRemote" style="display:none">
+      <div class="stat" id="stRemote"></div>
+      <div class="card">
+        <div class="bar"><b>素材源</b><span style="color:var(--mut)">其他 clawdata 面板地址 · 浏览/播放不复制文件 · 仅「拉取到本地」占用磁盘</span></div>
+        <div id="remoteSourceList"></div>
+        <div class="bar" style="margin-top:10px">
+          <input id="remoteNewName" placeholder="源名称（可选，如 105素材库）" style="min-width:160px">
+          <input id="remoteNewBase" placeholder="面板地址，如 http://10.168.1.105:8000" style="flex:1; min-width:240px">
+          <button class="btn" id="remoteAddBtn" onclick="addRemoteSource()">添加源</button>
+        </div>
+        <div class="bar"><span style="color:var(--mut)">远端需以 <code>--host 0.0.0.0</code> 启动对本机可达；添加时会验证对面是 clawdata 面板。浏览与播放不复制文件，仅「拉取到本地」会占用磁盘。</span></div>
+      </div>
+      <div class="card" style="margin-top:12px">
+        <div class="bar"><b>素材浏览</b><span id="remoteBrowseHint" style="color:var(--mut)">选择源后在线浏览、搜索与播放</span></div>
+        <div class="bar">
+          <select id="remoteSourceSel" onchange="onRemoteSourceChange()"></select>
+          <select id="remoteDaySel" onchange="loadRemoteRecords()"></select>
+          <input id="remoteQ" placeholder="搜索标题/作者/标签…" style="flex:1; min-width:200px" onkeydown="if(event.key==='Enter')loadRemoteRecords()">
+          <button class="btn" onclick="loadRemoteRecords()">搜索</button>
+        </div>
+        <div id="listRemote" style="margin-top:10px"></div>
+      </div>
+    </div>
     <div id="viewMigrate" style="display:none">
       <div class="card">
         <div class="bar"><b>从其他 clawdata 面板拉取</b><span style="color:var(--mut)">一个文件一个资产 · 按视频 ID 去重 · 中断可续传</span></div>
@@ -983,6 +1007,7 @@
       subscriptions:{title:'订阅博主', eyebrow:'SUBSCRIPTIONS', desc:'定期检查博主主页并下载新增视频，自动进入内容理解队列。'},
       digest:{title:'视频文库', eyebrow:'DIGEST', desc:'拉取订阅博主最新视频，提取简介与字幕中的文档代码信息，AI 整理成可检索、可问询的知识文档。'},
       assets:{title:'资产画廊', eyebrow:'ASSETS', desc:'按来源类型、来源工具、AI 标签和分类检索下载原片与工具结果。'},
+      remote:{title:'远程素材', eyebrow:'REMOTE', desc:'接入局域网内其他 clawdata 面板的素材库：在线浏览、搜索与播放，可单条拉取到本地。'},
       migrate:{title:'数据迁移', eyebrow:'MIGRATE', desc:'从其他 clawdata 面板按资产逐个拉取导入（视频 + 文库文档），或直接上传资产包 zip。'}
     };
 
@@ -1010,6 +1035,144 @@
     function showTags(){ showView('tags'); refreshTags(); }
     function showTools(){ showView('tools'); backTools(); refreshTools(); }
     function showAssets(){ showView('assets'); refreshAssets(); }
+
+    /* ============ 远程素材 ============ */
+    let REMOTE_SOURCES=[], REMOTE_STATES={}, REMOTE_CUR='';
+    function showRemote(){ showView('remote'); loadRemoteSources(); }
+
+    async function loadRemoteSources(){
+      try{
+        const d = await (await fetch('/api/remote/sources')).json();
+        REMOTE_SOURCES = d.sources||[]; REMOTE_STATES = d.states||{};
+        renderRemoteSources();
+        renderRemoteSourceSel();
+      }catch(e){ toast('读取源清单失败：'+e, 'bad'); }
+    }
+
+    function renderRemoteSources(){
+      document.getElementById('remoteSourceList').innerHTML = REMOTE_SOURCES.length ? REMOTE_SOURCES.map(s=>{
+        const st = REMOTE_STATES[s.id]||{};
+        const badge = s.enabled
+          ? (st.reachable ? '<span class="badge ok">在线</span>' : '<span class="badge fail">离线</span>')
+          : '<span class="badge already">停用</span>';
+        const detail = st.reachable ? ` · ${st.records}条 / ${st.days}天` : (st.error ? ` · ${esc(st.error)}` : '');
+        return `<div class="item">
+          <div class="info">
+            <div class="title">${esc(s.name)} ${badge}</div>
+            <div class="meta">${esc(s.base)}${detail}</div>
+          </div>
+          <button class="btn ghost" onclick="toggleRemoteSource('${s.id}', ${!s.enabled})">${s.enabled?'停用':'启用'}</button>
+          <button class="btn ghost bad" onclick="deleteRemoteSource('${s.id}')">删除</button>
+        </div>`;
+      }).join('') : '<div class="empty">尚未添加远程源——在下方填入另一台 clawdata 面板地址即可把它的素材库接入本机</div>';
+      const online = REMOTE_SOURCES.filter(s=>s.enabled && (REMOTE_STATES[s.id]||{}).reachable).length;
+      const total = Object.values(REMOTE_STATES).reduce((a,b)=>a+(b.records||0),0);
+      document.getElementById('stRemote').innerHTML = `
+        <div class="box"><div class="num">${REMOTE_SOURCES.length}</div><div class="lbl">远程源</div></div>
+        <div class="box"><div class="num">${online}</div><div class="lbl">在线</div></div>
+        <div class="box"><div class="num">${total}</div><div class="lbl">可浏览素材</div></div>`;
+    }
+
+    function renderRemoteSourceSel(){
+      const sel = document.getElementById('remoteSourceSel');
+      const cur = REMOTE_CUR || (REMOTE_SOURCES[0] && REMOTE_SOURCES[0].id) || '';
+      sel.innerHTML = REMOTE_SOURCES.length
+        ? REMOTE_SOURCES.map(s=>`<option value="${s.id}" ${s.id===cur?'selected':''}>${esc(s.name)}${s.enabled?'':'（停用）'}</option>`).join('')
+        : '<option value="">暂无源</option>';
+      if (cur && cur !== REMOTE_CUR){ REMOTE_CUR = cur; onRemoteSourceChange(); }
+      else if (!cur){ REMOTE_CUR=''; document.getElementById('listRemote').innerHTML='<div class="empty">请先添加远程源</div>'; }
+    }
+
+    function onRemoteSourceChange(){
+      REMOTE_CUR = document.getElementById('remoteSourceSel').value;
+      loadRemoteHistory();
+      loadRemoteRecords();
+    }
+
+    async function loadRemoteHistory(){
+      const daySel = document.getElementById('remoteDaySel');
+      daySel.innerHTML = '<option value="">最新（今天）</option>';
+      if (!REMOTE_CUR) return;
+      try{
+        const d = await (await fetch('/api/remote/history?source='+encodeURIComponent(REMOTE_CUR))).json();
+        if (d.ok && d.days){
+          daySel.innerHTML = '<option value="">最新（今天）</option>' + d.days.map(x=>
+            `<option value="${x.day}">${x.day}（${x.count}条）</option>`).join('');
+        }
+      }catch(e){ /* 源离线时保持只有“最新” */ }
+    }
+
+    const remoteItemHtml = (r, src) => `
+      <div class="item">
+        <div class="info">
+          <div class="title">${esc(r.title)||'—'}</div>
+          <div class="meta">${esc(r.author)||'—'}${r.account?` · ${esc(r.account)}`:''} · ${esc(r.word)||'链接'} · ${fmtSize(r.size)} · ${r.created_at||r.day||''}</div>
+        </div>
+        <button class="play" ${r.file?'':'disabled'} onclick="playUrl('/remote-media/${src.id}/${r.id}')">播放</button>
+        <button class="btn ghost" id="rpull-${src.id}-${r.id}" onclick="pullRemoteOne('${src.id}', ${r.id})">拉取到本地</button>
+      </div>`;
+
+    async function loadRemoteRecords(){
+      const el = document.getElementById('listRemote');
+      if (!REMOTE_CUR){ el.innerHTML='<div class="empty">请先添加并选择远程源</div>'; return; }
+      el.innerHTML='<div class="empty">加载中…</div>';
+      const day = document.getElementById('remoteDaySel').value || '';
+      const q = document.getElementById('remoteQ').value.trim();
+      const src = REMOTE_SOURCES.find(s=>s.id===REMOTE_CUR) || {};
+      try{
+        const d = await (await fetch(`/api/remote/records?source=${encodeURIComponent(REMOTE_CUR)}&day=${day}&q=${encodeURIComponent(q)}`)).json();
+        if (!d.ok){ el.innerHTML=`<div class="empty">${esc(d.error||'加载失败')}</div>`; return; }
+        document.getElementById('remoteBrowseHint').textContent =
+          `${src.name||''} · ${d.count}条${q?` · 搜“${q}”`:''}${day?` · ${day}`:' · 最新'}`;
+        el.innerHTML = (d.records||[]).length ? d.records.map(r=>remoteItemHtml(r, src)).join('') : '<div class="empty">暂无记录</div>';
+      }catch(e){ el.innerHTML='<div class="empty">加载失败：'+e+'</div>'; }
+    }
+
+    async function addRemoteSource(){
+      const name=document.getElementById('remoteNewName').value.trim();
+      const base=document.getElementById('remoteNewBase').value.trim();
+      if(!base.startsWith('http')){ toast('请填写面板地址（http://…）','bad'); return; }
+      const btn=document.getElementById('remoteAddBtn');
+      btn.disabled=true; btn.textContent='验证中…';
+      try{
+        const r=await fetch('/api/remote/sources',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,base})});
+        const d=await r.json();
+        if(!d.ok){ toast(d.error||'添加失败','bad'); return; }
+        toast('已添加源：'+d.source.name);
+        document.getElementById('remoteNewName').value='';
+        document.getElementById('remoteNewBase').value='';
+        await loadRemoteSources();
+      }catch(e){ toast('添加失败：'+e,'bad'); }
+      finally{ btn.disabled=false; btn.textContent='添加源'; }
+    }
+
+    async function toggleRemoteSource(sid, enable){
+      const r=await fetch('/api/remote/sources/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:sid,enabled:enable})});
+      const d=await r.json();
+      if(!d.ok){ toast(d.error||'操作失败','bad'); return; }
+      await loadRemoteSources();
+    }
+
+    async function deleteRemoteSource(sid){
+      if(!confirm('删除该远程源？仅移除本机配置，不影响两端任何数据。')) return;
+      const r=await fetch('/api/remote/sources/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:sid})});
+      const d=await r.json();
+      if(!d.ok){ toast(d.error||'删除失败','bad'); return; }
+      if (REMOTE_CUR===sid) REMOTE_CUR='';
+      await loadRemoteSources();
+    }
+
+    async function pullRemoteOne(sid, rid){
+      const btn=document.getElementById(`rpull-${sid}-${rid}`);
+      if(btn){ btn.disabled=true; btn.textContent='拉取中…'; }
+      try{
+        const r=await fetch('/api/remote/pull-one',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:sid,type:'downloads',id:rid})});
+        const d=await r.json();
+        if(!d.ok){ toast(d.error||'拉取失败','bad'); if(btn){btn.disabled=false; btn.textContent='拉取到本地';} return; }
+        if(d.action==='skipped'){ toast('本机已存在：'+(d.reason||'')); if(btn) btn.textContent='已存在'; }
+        else { toast('已导入本机记录 #'+d.id); if(btn) btn.textContent='已导入'; }
+      }catch(e){ toast('拉取失败：'+e,'bad'); if(btn){btn.disabled=false; btn.textContent='拉取到本地';} }
+    }
 
     /* ============ 数据迁移 ============ */
     let MIG_POLL=null;
@@ -1115,7 +1278,8 @@
       if (id === 'pose_match') refreshPoseMatch();
     }
 
-    function play(id){ document.getElementById('vid').src='/media/'+id; document.getElementById('player').style.display='flex'; }
+    function play(id){ playUrl('/media/'+id); }
+    function playUrl(url){ document.getElementById('vid').src=url; document.getElementById('player').style.display='flex'; }
     function closePlayer(){ document.getElementById('player').style.display='none'; document.getElementById('vid').pause(); document.getElementById('vid').src=''; }
 
     /* ============ 打标签 ============ */
@@ -2620,7 +2784,7 @@
     tickClock(); setInterval(tickClock,1000);
     const initialView=location.hash.slice(1);
     const initialParts=initialView.split('/');
-    if (initialView==='today') showToday(); else if (initialView==='history') showHistory(); else if (initialView==='tags') showTags(); else if (initialParts[0]==='tools') { showTools(); if (initialParts[1]) openTool(initialParts[1]); } else if (initialView==='subscriptions') showSubscriptions(); else if (initialView==='digest') showDigest(); else if (initialView==='assets') showAssets(); else if (initialView==='migrate') showMigrate(); else showToday();
+    if (initialView==='today') showToday(); else if (initialView==='history') showHistory(); else if (initialView==='tags') showTags(); else if (initialParts[0]==='tools') { showTools(); if (initialParts[1]) openTool(initialParts[1]); } else if (initialView==='subscriptions') showSubscriptions(); else if (initialView==='digest') showDigest(); else if (initialView==='assets') showAssets(); else if (initialView==='remote') showRemote(); else if (initialView==='migrate') showMigrate(); else showToday();
     pollCollectStatus();
   </script>
 </body>
