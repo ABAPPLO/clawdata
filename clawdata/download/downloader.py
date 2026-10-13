@@ -45,6 +45,8 @@ class DownloadConfig:
     category: str = ""  # 记录的类型/分类，写入 tag_category
     auto_tag: bool = True
     auto_tag_enqueuer: Any = None
+    max_item_seconds: float = 1200.0  # 单文件下载硬上限：防连接"涓流"导致任务永久卡住
+    should_stop: Any = None  # 协作式停止：返回 True 时不再开始后续条目/重试
 
 
 def _log(config: DownloadConfig, msg: str) -> None:
@@ -73,6 +75,7 @@ def _download_one(url: str, dest: str, config: DownloadConfig, referer: str) -> 
 
     req = urllib.request.Request(url, headers=headers)
     written = 0
+    deadline = time.monotonic() + max(60.0, float(config.max_item_seconds))
     with urllib.request.urlopen(req, timeout=config.timeout) as resp:
         mode = "ab" if already and resp.status == 206 else "wb"
         if already and resp.status != 206:
@@ -84,6 +87,9 @@ def _download_one(url: str, dest: str, config: DownloadConfig, referer: str) -> 
                     break
                 f.write(chunk)
                 written += len(chunk)
+                if time.monotonic() > deadline:
+                    raise TimeoutError(
+                        f"单文件下载超过 {int(config.max_item_seconds)} 秒未完成，放弃：{os.path.basename(dest)}")
     os.replace(partial, dest)
     return written
 
@@ -139,6 +145,9 @@ def download_items(items: list[dict[str, Any]] | None, config: DownloadConfig | 
 
     ok = 0
     for i, item in enumerate(items, start=1):
+        if config.should_stop and config.should_stop():
+            _log(config, "收到停止请求，中止后续下载")
+            break
         config.quiet.wait_until_open()
         title = str(item.get("title", "") or f"video_{i}")
         filename = _safe_name(str(item.get("filename", "")) or title + ".mp4")
@@ -160,6 +169,9 @@ def download_items(items: list[dict[str, Any]] | None, config: DownloadConfig | 
 
         success = False
         for attempt in range(1, config.max_retry + 1):
+            if config.should_stop and config.should_stop():
+                _log(config, "收到停止请求，中止重试")
+                break
             try:
                 written = _download_media(item, dest, config)
                 _log(config, f"  完成 ({written/1024:.0f} KB)：{filename}")

@@ -12,17 +12,34 @@ python -m clawdata.web --port 8000    # 启动面板/API（前台运行）
 
 - API 基址：`http://127.0.0.1:8000`，仅绑定本机回环，无鉴权
 - 所有 POST/PUT 均为 JSON body（`Content-Type: application/json`），响应均为 JSON
+- **请求体必须是 UTF-8**：非 UTF-8（如 Windows GBK 控制台直接 curl 中文）会得到 HTTP 400，宁可拒绝也不把乱码写进配置。curl 前先 `chcp 65001`，或把中文写进文件用 `--data-binary @file`
 - 命令行入口见文末「CLI 等价命令」
 
 ## 通用模式：长任务 = 启动 + 轮询
 
-采集、下载、订阅刷新、文库整理都是后台任务，同一时间各只允许一个实例，模式统一：
+采集、下载、订阅刷新、文库整理都是后台任务。其中**订阅刷新与链接/B站下载支持排队**（忙时新请求进队列自动接续，见下），其余类型同一时间只允许一个实例：
 
-1. `POST /api/xxx/...` 启动 → 立即返回 `{ok: true, active: true, job: {...}}`；已在运行则返回 HTTP 409
-2. `GET /api/xxx/status` 轮询（建议 3~4 秒一次）→ `{active: bool, job: {status, message, ...}}`
-3. `job.status` 变为 `completed` / `failed` 即结束，`active: false`；之后拉列表接口看结果
+1. `POST /api/xxx/...` 启动 → 立即返回 `{ok: true, active: true, job: {...}}`
+   - 支持排队的接口忙时返回 `{ok: true, queued: true, position: N}`（不再是 409）
+   - 不支持排队的接口忙时返回 HTTP 409
+2. `GET /api/xxx/status` 轮询（建议 3~4 秒一次）→ `{active: bool, job: {status, message, ...}, queued: [...]}`
+3. `job.status` 变为 `completed` / `failed` / `stopped` 即结束，`active: false`；之后拉列表接口看结果
+4. 订阅/下载任务的 `job.stalled: true` 表示超过 10 分钟无进展（疑似卡死）；此时用 stop 接口的 `force: true` 立即释放运行位，然后可重新启动
 
 超时设置：启动接口秒回；**`/api/digest/ask` 是同步接口，要等 AI 生成，客户端超时建议 ≥ 120 秒**。
+
+### 停止与排队管理（订阅刷新 + 链接/B站下载）
+
+```bash
+# 协作式停止：当前视频完成后停止，排队任务保留
+curl -X POST http://127.0.0.1:8000/api/subscriptions/stop -H "Content-Type: application/json" -d '{}'
+curl -X POST http://127.0.0.1:8000/api/links/stop        -H "Content-Type: application/json" -d '{}'
+# 强制停止：任务卡死时立即释放运行位（后台残留的单个下载会自行结束），排队任务保留
+curl -X POST http://127.0.0.1:8000/api/subscriptions/stop -H "Content-Type: application/json" -d '{"force": true}'
+# 队列管理：移除一条排队任务（id 见 status 的 queued[].id）/ 清空队列
+curl -X POST http://127.0.0.1:8000/api/links/queue -H "Content-Type: application/json" -d '{"remove": 3}'
+curl -X POST http://127.0.0.1:8000/api/subscriptions/queue -H "Content-Type: application/json" -d '{"clear": true}'
+```
 
 ---
 
@@ -232,8 +249,8 @@ curl -X POST http://127.0.0.1:8000/api/remote/pull-one \
 部署形态 = Web 面板 + MCP 服务两个常驻单元：`clawdata.service`（:8000 面板/API）与
 `clawdata-mcp.service`（:8100 streamable-http，Bearer Token 在 `config/mcp.json`，健康检查 `GET /`）。
 
-`python -m clawdata.mcp` 把面板 API 包装成 32 个 MCP 工具：查询问询（status_overview/digest_list/digest_ask…）、
-任务启动+轮询（subscription_refresh_start→job_status…）、迁移（migrate_pull_start/migrate_adopt_start…）、
+`python -m clawdata.mcp` 把面板 API 包装成 33 个 MCP 工具：查询问询（status_overview/digest_list/digest_ask…）、
+任务启动+轮询/停止（subscription_refresh_start→job_status→job_stop…）、迁移（migrate_pull_start/migrate_adopt_start…）、
 远程素材源（remote_sources_list/remote_records/remote_pull_one…）。
 删除/迁移等危险工具需显式 `confirm=true`。客户端两种接法：
 - HTTP 直连（推荐）：`url = http://<部署机>:8100/mcp` + `Authorization: Bearer <token>`

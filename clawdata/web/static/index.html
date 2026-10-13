@@ -305,8 +305,12 @@
             <div class="grow">
               <b id="linksMsg">准备开始…</b>
               <span id="linksCounts" style="color:var(--mut); font-size:12px;"></span>
+              <span id="linksStall" style="display:none;color:var(--bad);font-size:12px"></span>
               <div class="progressbar"><span id="linksFill"></span></div>
+              <div class="chips" id="linksQueue" style="margin-top:6px"></div>
             </div>
+            <button class="btn ghost bad" id="linksStopBtn" onclick="stopLinks(false)">停止</button>
+            <button class="btn bad" id="linksForceBtn" style="display:none" onclick="stopLinks(true)">强制停止</button>
           </div>
         </div>
         <div class="card">
@@ -324,8 +328,12 @@
             <div class="grow">
               <b id="biliMsg">准备开始…</b>
               <span id="biliCounts" style="color:var(--mut); font-size:12px;"></span>
+              <span id="biliStall" style="display:none;color:var(--bad);font-size:12px"></span>
               <div class="progressbar"><span id="biliFill"></span></div>
+              <div class="chips" id="biliQueue" style="margin-top:6px"></div>
             </div>
+            <button class="btn ghost bad" id="biliStopBtn" onclick="stopLinks(false)">停止</button>
+            <button class="btn bad" id="biliForceBtn" style="display:none" onclick="stopLinks(true)">强制停止</button>
           </div>
         </div>
         <div class="card"><h2>今日产出</h2><div class="sub">仅包含手动触发的下载任务</div><div id="listToday"></div></div>
@@ -560,8 +568,12 @@
           <div class="grow">
             <b id="subscriptionMsg">准备开始…</b>
             <span id="subscriptionCounts" style="color:var(--mut);font-size:12px"></span>
+            <span id="subscriptionStall" style="display:none;color:var(--bad);font-size:12px"></span>
             <div class="progressbar"><span id="subscriptionFill"></span></div>
+            <div class="chips" id="subscriptionQueue" style="margin-top:6px"></div>
           </div>
+          <button class="btn ghost bad" id="subscriptionStopBtn" onclick="stopSubscriptions(false)">停止</button>
+          <button class="btn bad" id="subscriptionForceBtn" style="display:none" onclick="stopSubscriptions(true)">强制停止</button>
         </div>
       </div>
       <div class="card"><h2>订阅列表</h2><div class="sub">点击博主名称或“查看视频”回看该订阅已下载的全部记录。</div><div id="subscriptionList"><div class="empty">加载中…</div></div></div>
@@ -870,33 +882,55 @@
       pollCollectStatus();
     }
 
-    /* ============ 链接快速下载 / B站采集（共用一个后台任务） ============ */
+    /* ============ 链接快速下载 / B站采集（共用一个后台任务，支持排队） ============ */
     let linksTimer = null;
-    function linksRender(job){
+    function renderJobExtras(prefix, job, active){
+      const stall=document.getElementById(prefix+'Stall');
+      if(stall){
+        if(job&&job.stalled){ stall.style.display='inline'; stall.textContent=` ⚠ 已 ${Math.round(job.stalled_seconds/60)} 分钟无进展，可强制停止`; }
+        else stall.style.display='none';
+      }
+      const stopBtn=document.getElementById(prefix+'StopBtn');
+      const forceBtn=document.getElementById(prefix+'ForceBtn');
+      if(stopBtn) stopBtn.style.display=active?'':'none';
+      if(forceBtn) forceBtn.style.display=(active&&job&&job.stalled)?'':'none';
+    }
+    function renderQueueChips(elId, queued, action){
+      const el=document.getElementById(elId);
+      if(!el) return;
+      if(!queued||!queued.length){ el.innerHTML=''; return; }
+      el.innerHTML = `<span style="color:var(--mut);font-size:12px">排队 ${queued.length} 项：</span>` +
+        queued.map(q=>`<span class="chip" style="cursor:pointer" title="点击移除该排队任务" onclick="${action}(${q.id})">${esc(q.label||('任务'+q.id))} ✕</span>`).join('');
+    }
+    function linksRender(job, d){
+      const queued=(d&&d.queued)||[];
+      const show = (job && job.status !== 'idle') || queued.length;
+      const active = !!(d&&d.active);
       const blocks = [
-        ['linksProgress','linksMsg','linksCounts','linksFill'],
-        ['biliProgress','biliMsg','biliCounts','biliFill'],
+        ['linksProgress','linksMsg','linksCounts','linksFill','links'],
+        ['biliProgress','biliMsg','biliCounts','biliFill','bili'],
       ];
-      const show = job && job.status !== 'idle';
-      blocks.forEach(([pid, mid, cid, fid]) => {
+      blocks.forEach(([pid, mid, cid, fid, px]) => {
         const box = document.getElementById(pid);
         if (!box) return;
         if (!show){ box.style.display='none'; return; }
         box.style.display='flex';
-        document.getElementById(mid).textContent = job.message || job.status;
-        const total = job.total||0, done = job.downloaded||0;
+        document.getElementById(mid).textContent = (job&&job.message) || (job&&job.status) || '排队任务等待开始…';
+        const total = job?(job.total||0):0, done = job?(job.downloaded||0):0;
         document.getElementById(cid).textContent =
           total ? ` 解析 ${job.resolved||0}/${total} · 已下载 ${done} · 失败 ${job.errors||0}`
-                : (job.status==='running' ? ' 解析中…' : '');
-        const pct = total ? Math.min(100, Math.round((done / total) * 100)) : (job.status==='running' ? 10 : 100);
+                : (active ? ' 解析中…' : '');
+        const pct = total ? Math.min(100, Math.round((done / total) * 100)) : (active ? 10 : 100);
         document.getElementById(fid).style.width = pct + '%';
+        renderJobExtras(px, job, active);
+        renderQueueChips(px+'Queue', queued, 'linksQueueRemove');
       });
     }
     async function pollLinksStatus(){
       try {
         const d = await (await fetch('/api/links/status')).json();
-        linksRender(d.job);
-        if (!d.active && linksTimer){
+        linksRender(d.job, d);
+        if (!d.active && !(d.queued||[]).length && linksTimer){
           clearInterval(linksTimer); linksTimer = null;
           refreshToday();
         }
@@ -904,9 +938,20 @@
     }
     function linksWatch(d){
       if (!d.ok){ toast(d.error || '启动失败','error'); return; }
-      linksRender(d.job);
+      if (d.queued){ toast(`已有下载任务在运行，已加入队列（第 ${d.position} 位）`, 'success'); }
+      linksRender(d.job, d);
       if (linksTimer) clearInterval(linksTimer);
       linksTimer = setInterval(pollLinksStatus, 1500);
+    }
+    async function stopLinks(force){
+      if(force){ if(!confirm('强制停止将立即放弃当前下载任务（后台未完成的单个下载会自行结束）。确定？'))return; }
+      else { if(!confirm('停止下载任务？当前视频完成后即停止，排队任务保留。'))return; }
+      await fetch('/api/links/stop', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({force:!!force})});
+      pollLinksStatus();
+    }
+    async function linksQueueRemove(id){
+      await fetch('/api/links/queue', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({remove:id})});
+      pollLinksStatus();
     }
     async function startLinksDownload(){
       const text = document.getElementById('linksText').value.trim();
@@ -1917,16 +1962,22 @@
       renderSubscriptionStatus(sd);
     }
     function renderSubscriptionStatus(sd){
-      const job=sd.job, box=document.getElementById('subscriptionProgress');
-      box.style.display=sd.active?'flex':'none';
-      if(!job)return;
-      document.getElementById('subscriptionMsg').textContent=job.message||job.status;
-      document.getElementById('subscriptionCounts').textContent=
-        job.total?` · ${job.index||0}/${job.total} · 新增 ${job.downloaded||0} · 失败 ${job.errors||0}`:'';
-      document.getElementById('subscriptionFill').style.width=
-        job.total?Math.min(100,Math.round((job.index||0)/job.total*100))+'%':'10%';
-      if(sd.active&&!SUBSCRIPTION_POLL)SUBSCRIPTION_POLL=setInterval(refreshSubscriptions,4000);
-      if(!sd.active&&SUBSCRIPTION_POLL){clearInterval(SUBSCRIPTION_POLL);SUBSCRIPTION_POLL=null;}
+      const job=sd.job, queued=sd.queued||[], box=document.getElementById('subscriptionProgress');
+      box.style.display=(sd.active||queued.length)?'flex':'none';
+      if(!job&&!queued.length)return;
+      if(job){
+        document.getElementById('subscriptionMsg').textContent=job.message||job.status;
+        document.getElementById('subscriptionCounts').textContent=
+          job.total?` · ${job.index||0}/${job.total} · 新增 ${job.downloaded||0} · 失败 ${job.errors||0}`:'';
+        document.getElementById('subscriptionFill').style.width=
+          job.total?Math.min(100,Math.round((job.index||0)/job.total*100))+'%':'10%';
+      }else{
+        document.getElementById('subscriptionMsg').textContent='有排队任务等待开始…';
+      }
+      renderJobExtras('subscription', job, sd.active);
+      renderQueueChips('subscriptionQueue', queued, 'subscriptionQueueRemove');
+      if((sd.active||queued.length)&&!SUBSCRIPTION_POLL)SUBSCRIPTION_POLL=setInterval(refreshSubscriptions,4000);
+      if(!(sd.active||queued.length)&&SUBSCRIPTION_POLL){clearInterval(SUBSCRIPTION_POLL);SUBSCRIPTION_POLL=null;}
     }
     async function addSubscription(){
       const body={
@@ -1946,11 +1997,23 @@
     async function refreshSubscription(id){
       const res=await (await fetch('/api/subscriptions/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})})).json();
       if(!res.ok){toast(res.error||'启动失败','error');return;}
+      if(res.queued)toast(`已有更新任务在运行，已加入队列（第 ${res.position} 位）`,'success');
       refreshSubscriptions();
     }
     async function refreshAllSubscriptions(){
       const res=await (await fetch('/api/subscriptions/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).json();
       if(!res.ok){toast(res.error||'启动失败','error');return;}
+      if(res.queued)toast(`已有更新任务在运行，已加入队列（第 ${res.position} 位）`,'success');
+      refreshSubscriptions();
+    }
+    async function stopSubscriptions(force){
+      if(force){ if(!confirm('强制停止将立即放弃当前订阅任务（后台未完成的单个下载会自行结束）。确定？'))return; }
+      else { if(!confirm('停止订阅更新？当前视频完成后即停止，排队任务保留。'))return; }
+      await fetch('/api/subscriptions/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({force:!!force})});
+      refreshSubscriptions();
+    }
+    async function subscriptionQueueRemove(id){
+      await fetch('/api/subscriptions/queue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({remove:id})});
       refreshSubscriptions();
     }
     async function openSubscriptionVideos(id){

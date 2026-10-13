@@ -20,6 +20,7 @@ import argparse
 import base64
 import binascii
 import io
+import itertools
 import json
 import mimetypes
 import os
@@ -66,14 +67,19 @@ POSE_WORKER = None
 COLLECT_LOCK = threading.Lock()
 COLLECT_JOB: dict | None = None
 COLLECT_THREAD: threading.Thread | None = None
-SUBSCRIPTION_LOCK = threading.Lock()
+SUBSCRIPTION_LOCK = threading.RLock()
 SUBSCRIPTION_JOB: dict | None = None
 SUBSCRIPTION_THREAD: threading.Thread | None = None
 SUBSCRIPTION_SCHEDULER: threading.Thread | None = None
-# 面板「链接速下 / B站采集」任务（同一时间只跑一个）
-LINKS_LOCK = threading.Lock()
+# 订阅刷新排队：任务运行期间新请求不再被 409 拒绝，而是进入队列，当前任务结束后自动接续
+SUBSCRIPTION_QUEUE: list[dict] = []
+SUBSCRIPTION_GENERATION = 0  # 强制停止后 +1，旧执行链检测到代号变化即退出、不再碰全局状态
+# 面板「链接速下 / B站采集」任务（同一时间只跑一个；排队机制同订阅刷新）
+LINKS_LOCK = threading.RLock()
 LINKS_JOB: dict | None = None
 LINKS_THREAD: threading.Thread | None = None
+LINKS_QUEUE: list[dict] = []
+LINKS_GENERATION = 0
 # 面板「视频文库」整理任务（同一时间只跑一个）
 DIGEST_LOCK = threading.Lock()
 DIGEST_JOB: dict | None = None
@@ -87,6 +93,47 @@ MIGRATE_THREAD: threading.Thread | None = None
 # 随机停顿若干秒，模拟人类「看完一页再往下翻」，避免高频拉取与暴力下载
 SUBSCRIPTION_MAX_PAGES = 20
 SUBSCRIPTION_PAGE_TURN_DELAY = (5.0, 12.0)
+
+class _BodyError(Exception):
+    """请求体无法解析（编码损坏等）。拒绝整个请求，避免把乱码写进配置/数据库。"""
+
+
+# 任务心跳：running 状态超过该秒数没有任何进展更新，面板标记「疑似卡住」并建议强制停止
+STALL_WARN_SECONDS = 600
+_QUEUE_SEQ = itertools.count(1)
+
+
+def _now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _queue_view(queue: list[dict]) -> list[dict]:
+    return [{k: q.get(k) for k in ("id", "label", "enqueued_at")} for q in queue]
+
+
+def _job_with_health(job: dict | None) -> dict | None:
+    """给 running 中的任务补上心跳健康度：长时间无进展标记 stalled。"""
+    if not job:
+        return None
+    out = dict(job)
+    if out.get("status") == "running" and out.get("updated_at"):
+        try:
+            age = (datetime.now() - datetime.fromisoformat(out["updated_at"])).total_seconds()
+        except (ValueError, TypeError):
+            age = 0
+        out["stalled_seconds"] = int(max(0, age))
+        out["stalled"] = age > STALL_WARN_SECONDS
+    return out
+
+
+def _subscription_label(target_id: int) -> str:
+    if not target_id:
+        return "全部到期订阅"
+    try:
+        sub = store.get_subscription(Handler.db, int(target_id))
+    except Exception:  # noqa: BLE001
+        sub = None
+    return f"订阅「{(sub or {}).get('name') or target_id}」"
 
 
 def _collect_status() -> dict:
@@ -211,13 +258,15 @@ def refresh_today_hot_events() -> tuple[int, str]:
 def _subscription_status() -> dict:
     with SUBSCRIPTION_LOCK:
         if not SUBSCRIPTION_JOB:
-            return {"active": False, "job": None}
+            return {"active": False, "job": None, "queued": _queue_view(SUBSCRIPTION_QUEUE)}
         job = {k: v for k, v in SUBSCRIPTION_JOB.items() if k != "stop"}
-        return {"active": job.get("status") == "running", "job": job}
+        return {"active": job.get("status") == "running",
+                "job": _job_with_health(job), "queued": _queue_view(SUBSCRIPTION_QUEUE)}
 
 
 def _subscription_update(job: dict, **changes) -> None:
     with SUBSCRIPTION_LOCK:
+        changes.setdefault("updated_at", _now_iso())
         job.update(changes)
 
 
@@ -250,6 +299,9 @@ def _update_bilibili_subscription(db: str, job: dict, idx: int, total: int, sub:
         _subscription_update(job, message=f"({idx}/{total}) 「{name}」第 {page_no} 页：新视频 {len(new)} 条，开始下载…")
         page_downloaded = 0
         for v in new:
+            if job.get("stop"):
+                _subscription_update(job, message=f"({idx}/{total}) 「{name}」收到停止请求，停止后续下载")
+                break
             try:
                 info = bili_mod.resolve(v["bvid"], bcookies)
             except Exception as exc:  # noqa: BLE001
@@ -269,12 +321,15 @@ def _update_bilibili_subscription(db: str, job: dict, idx: int, total: int, sub:
                 quiet=QuietHours(dtime(0, 0), dtime(0, 0)), cookies={},
                 store=db, category=sub.get("category") or "订阅UP主",
                 auto_tag_enqueuer=_auto_tag_downloaded,
+                should_stop=lambda: bool(job.get("stop")),
             ))
             downloaded += 1
             page_downloaded += 1
             _subscription_update(job, message=f"({idx}/{total}) 「{name}」第 {page_no} 页下载中：本页 {page_downloaded}/{len(new)}")
         if page_downloaded == 0:
             # 本页新视频全部解析失败（如充电专属），继续翻页大概率还是失败，先停
+            break
+        if job.get("stop"):
             break
     now = datetime.now()
     interval = max(1, int(sub.get("interval_hours") or 6))
@@ -305,6 +360,9 @@ def _update_douyin_subscription(db: str, job: dict, idx: int, total: int,
     def _download_new(items: list[dict]) -> int:
         done = 0
         for v in items:
+            if job.get("stop"):
+                _subscription_update(job, message=f"({idx}/{total}) {label['text']}收到停止请求，停止后续下载")
+                break
             account = v.get("account") or v.get("author") or name
             desc = (v.get("title") or v.get("aweme_id") or "video")[:30]
             download_items([{
@@ -320,6 +378,7 @@ def _update_douyin_subscription(db: str, job: dict, idx: int, total: int,
                 quiet=QuietHours(dtime(0, 0), dtime(0, 0)), cookies=cookies,
                 store=db, category=sub.get("category") or "订阅博主",
                 auto_tag_enqueuer=_auto_tag_downloaded,
+                should_stop=lambda: bool(job.get("stop")),
             ))
             done += 1
             _subscription_update(job, message=f"({idx}/{total}) {label['text']}下载 {done}/{len(items)}")
@@ -340,6 +399,8 @@ def _update_douyin_subscription(db: str, job: dict, idx: int, total: int,
             label["text"] = f"「{name}」第 {page_no} 页："
             _subscription_update(job, message=f"({idx}/{total}) 「{name}」第 {page_no} 页：新视频 {len(new)} 条，开始下载…")
             downloaded += _download_new(new)
+            if job.get("stop"):
+                break
     except Exception:
         if downloaded:
             raise  # 已下载过一部分，交回外层记录错误即可，回退反而可能重复下载
@@ -393,25 +454,96 @@ def _subscription_worker(target_id: int = 0) -> None:
                     error=str(exc)[:500])
                 _subscription_update(job, errors=job.get("errors", 0) + 1,
                                      message=f"「{name}」更新失败：{exc}")
-        _subscription_update(job, status="completed",
-                             finished_at=datetime.now().isoformat(timespec="seconds"), message="订阅更新完成")
+            if job.get("stop"):
+                break
+        _subscription_update(job, status="stopped" if job.get("stop") else "completed",
+                             finished_at=_now_iso(),
+                             message="已停止" if job.get("stop") else "订阅更新完成")
     except Exception as exc:
         _subscription_update(job, status="failed", error=str(exc),
-                             finished_at=datetime.now().isoformat(timespec="seconds"), message=f"失败：{exc}")
+                             finished_at=_now_iso(), message=f"失败：{exc}")
 
 
-def _start_subscription_refresh(target_id: int = 0) -> bool:
-    global SUBSCRIPTION_JOB, SUBSCRIPTION_THREAD
+def _subscription_runner(gen: int, first: dict) -> None:
+    """订阅任务执行链：跑完当前任务后自动接续队列里的下一条。
+
+    gen 是本执行链的代号；强制停止会推进全局代号，旧链在此检测到失配即退出，
+    不再读写全局状态（避免与用户手动重启的新链双跑），队列留给新链接手。
+    首个任务的 job 已由 _start_subscription_refresh 同步创建，这里只负责接续后续排队项。
+    """
+    global SUBSCRIPTION_JOB
+    item: dict | None = first
+    while item is not None:
+        try:
+            _subscription_worker(int(item["target_id"]))
+        except Exception as exc:  # noqa: BLE001  # worker 内部已兜底，这里防线程级异常挂死状态
+            with SUBSCRIPTION_LOCK:
+                if gen == SUBSCRIPTION_GENERATION and SUBSCRIPTION_JOB and SUBSCRIPTION_JOB.get("status") == "running":
+                    SUBSCRIPTION_JOB.update(status="failed", error=str(exc)[:300],
+                                            message=f"失败：{exc}", finished_at=_now_iso())
+        with SUBSCRIPTION_LOCK:
+            if gen != SUBSCRIPTION_GENERATION:
+                return
+            item = SUBSCRIPTION_QUEUE.pop(0) if SUBSCRIPTION_QUEUE else None
+            if item is not None:
+                SUBSCRIPTION_JOB = {
+                    "status": "running", "target_id": int(item["target_id"]), "total": 0,
+                    "index": 0, "current": "", "downloaded": 0, "errors": 0,
+                    "label": item.get("label", ""), "message": "准备开始…",
+                    "started_at": _now_iso(), "finished_at": "", "updated_at": _now_iso(),
+                }
+
+
+def _start_subscription_refresh(target_id: int = 0, label: str = "",
+                                from_scheduler: bool = False) -> tuple[str, int]:
+    """启动（或排队）一次订阅刷新。
+
+    返回 ("started", 0) 直接开跑；("queued", 位置) 已有任务在运行、排入队列；
+    ("skipped", 0) 定时调度发现忙时直接跳过本轮（不排队，防止任务链越积越长）。
+    """
+    global SUBSCRIPTION_THREAD, SUBSCRIPTION_GENERATION, SUBSCRIPTION_JOB
     with SUBSCRIPTION_LOCK:
         if SUBSCRIPTION_JOB and SUBSCRIPTION_JOB.get("status") == "running":
-            return False
-        SUBSCRIPTION_JOB = {"status": "running", "target_id": target_id, "total": 0,
-                            "index": 0, "current": "", "downloaded": 0, "errors": 0,
-                            "message": "准备开始…",
-                            "started_at": datetime.now().isoformat(timespec="seconds"), "finished_at": ""}
-        SUBSCRIPTION_THREAD = threading.Thread(target=_subscription_worker, args=(target_id,),
+            if from_scheduler:
+                return ("skipped", 0)
+            SUBSCRIPTION_QUEUE.append({
+                "id": next(_QUEUE_SEQ), "target_id": int(target_id),
+                "label": label or _subscription_label(target_id), "enqueued_at": _now_iso(),
+            })
+            return ("queued", len(SUBSCRIPTION_QUEUE))
+        entry = {"target_id": int(target_id),
+                 "label": label or _subscription_label(target_id)}
+        # 在锁内同步置位运行状态：start 返回时 status 立即可见，连发请求不会双跑
+        SUBSCRIPTION_JOB = {
+            "status": "running", "target_id": int(target_id), "total": 0,
+            "index": 0, "current": "", "downloaded": 0, "errors": 0,
+            "label": entry["label"], "message": "准备开始…",
+            "started_at": _now_iso(), "finished_at": "", "updated_at": _now_iso(),
+        }
+        SUBSCRIPTION_GENERATION += 1
+        gen = SUBSCRIPTION_GENERATION
+        SUBSCRIPTION_THREAD = threading.Thread(target=_subscription_runner, args=(gen, entry),
                                                daemon=True, name="subscription-worker")
         SUBSCRIPTION_THREAD.start()
+        return ("started", 0)
+
+
+def _force_stop_subscription() -> bool:
+    """强制停止订阅任务：立即释放「运行中」状态位，允许马上开始新任务。
+
+    卡死的线程无法在 Python 里杀死，会留在后台自行结束；其持有的 job 是旧字典，
+    之后的状态更新不会再影响面板。队列里的排队任务保留，由下一次启动接续。
+    """
+    global SUBSCRIPTION_GENERATION
+    with SUBSCRIPTION_LOCK:
+        job = SUBSCRIPTION_JOB
+        if not job or job.get("status") != "running":
+            return False
+        job["stop"] = True
+        job["status"] = "stopped"
+        job["message"] = "已强制停止；后台若仍有残留下载，会自行结束"
+        job["finished_at"] = _now_iso()
+        SUBSCRIPTION_GENERATION += 1
         return True
 
 
@@ -530,13 +662,15 @@ def _start_digest_job(subscription_id: int = 0, limit: int = 0) -> bool:
 def _links_status() -> dict:
     with LINKS_LOCK:
         if not LINKS_JOB:
-            return {"active": False, "job": None}
+            return {"active": False, "job": None, "queued": _queue_view(LINKS_QUEUE)}
         job = {k: v for k, v in LINKS_JOB.items() if k != "stop"}
-        return {"active": job.get("status") == "running", "job": job}
+        return {"active": job.get("status") == "running",
+                "job": _job_with_health(job), "queued": _queue_view(LINKS_QUEUE)}
 
 
 def _links_update(job: dict, **changes) -> None:
     with LINKS_LOCK:
+        changes.setdefault("updated_at", _now_iso())
         job.update(changes)
 
 
@@ -544,6 +678,7 @@ def _links_worker(kind: str, payload: dict) -> None:
     """统一下载任务：粘贴链接（抖音/B站混贴）或 B站热门/关键词，解析后串行下载入库。"""
     db = Handler.db
     job = LINKS_JOB
+    stop = lambda: bool(job.get("stop"))  # noqa: E731
     try:
         category = str(payload.get("category") or "").strip()
         try:
@@ -577,6 +712,9 @@ def _links_worker(kind: str, payload: dict) -> None:
             _links_update(job, total=len(found))
             items = []
             for i, v in enumerate(found, start=1):
+                if stop():
+                    _links_update(job, message="收到停止请求，停止解析")
+                    break
                 _links_update(job, message=f"解析 ({i}/{len(found)}) {(v.get('title') or '')[:36]}")
                 try:
                     info = bili_mod.resolve(v["bvid"], bcookies)
@@ -598,6 +736,11 @@ def _links_worker(kind: str, payload: dict) -> None:
         if category:
             for it in items:
                 it["category"] = category
+        if stop():
+            _links_update(job, status="stopped",
+                          message=f"已停止：解析 {len(items)} 条，未继续下载",
+                          finished_at=_now_iso())
+            return
         _links_update(job, message=f"解析完成，开始下载 {len(items)} 条")
         ok = download_items(items, DownloadConfig(
             outdir=os.path.join(ROOT, "downloads"),
@@ -606,26 +749,93 @@ def _links_worker(kind: str, payload: dict) -> None:
             cookies=douyin_cookies,
             store=db, category=category or "链接下载",
             auto_tag_enqueuer=_auto_tag_downloaded,
+            should_stop=stop,
         ))
-        _links_update(job, downloaded=int(ok), status="completed",
-                      message=f"完成：下载 {ok}/{len(items)} 条",
-                      finished_at=datetime.now().isoformat(timespec="seconds"))
+        _links_update(job, downloaded=int(ok), status="stopped" if stop() else "completed",
+                      message=("已停止" if stop() else "完成") + f"：下载 {ok}/{len(items)} 条",
+                      finished_at=_now_iso())
     except Exception as exc:  # noqa: BLE001
         _links_update(job, status="failed", error=str(exc), message=f"失败：{exc}",
-                      finished_at=datetime.now().isoformat(timespec="seconds"))
+                      finished_at=_now_iso())
 
 
-def _start_links_job(kind: str, payload: dict) -> bool:
-    global LINKS_JOB, LINKS_THREAD
+def _links_job_label(kind: str, payload: dict) -> str:
+    if kind == "links":
+        n = len([ln for ln in re.split(r"[\n\r]+", str(payload.get("text") or "")) if ln.strip()])
+        return f"链接下载（{n} 条）"
+    if kind == "bili_popular":
+        return f"B站热门榜（{payload.get('count') or 5} 条）"
+    return f"B站关键词「{payload.get('keyword') or ''}」（{payload.get('count') or 5} 条）"
+
+
+def _links_runner(gen: int, first: dict) -> None:
+    """下载任务执行链：跑完当前任务后自动接续队列里的下一条（机制同订阅执行链）。
+
+    gen 是本执行链的代号；强制停止会推进全局代号，旧链在此检测到失配即退出，
+    不再读写全局状态（避免与用户手动重启的新链双跑），队列留给新链接手。
+    首个任务的 job 已由 _start_links_job 同步创建，这里只负责接续后续排队项。
+    """
+    global LINKS_JOB
+    item: dict | None = first
+    while item is not None:
+        try:
+            _links_worker(item["kind"], item["payload"])
+        except Exception as exc:  # noqa: BLE001
+            with LINKS_LOCK:
+                if gen == LINKS_GENERATION and LINKS_JOB and LINKS_JOB.get("status") == "running":
+                    LINKS_JOB.update(status="failed", error=str(exc)[:300],
+                                      message=f"失败：{exc}", finished_at=_now_iso())
+        with LINKS_LOCK:
+            if gen != LINKS_GENERATION:
+                return
+            item = LINKS_QUEUE.pop(0) if LINKS_QUEUE else None
+            if item is not None:
+                LINKS_JOB = {
+                    "status": "running", "kind": item["kind"], "total": 0, "resolved": 0,
+                    "downloaded": 0, "errors": 0, "label": item.get("label", ""),
+                    "message": "准备开始…", "error": "",
+                    "started_at": _now_iso(), "finished_at": "", "updated_at": _now_iso(),
+                }
+
+
+def _start_links_job(kind: str, payload: dict) -> tuple[str, int]:
+    """启动（或排队）一个下载任务。返回 ("started", 0) 或 ("queued", 排队位置)。"""
+    global LINKS_THREAD, LINKS_GENERATION, LINKS_JOB
     with LINKS_LOCK:
         if LINKS_JOB and LINKS_JOB.get("status") == "running":
-            return False
-        LINKS_JOB = {"status": "running", "kind": kind, "total": 0, "resolved": 0,
-                     "downloaded": 0, "errors": 0, "message": "准备开始…", "error": "",
-                     "started_at": datetime.now().isoformat(timespec="seconds"), "finished_at": ""}
-        LINKS_THREAD = threading.Thread(target=_links_worker, args=(kind, payload),
+            LINKS_QUEUE.append({
+                "id": next(_QUEUE_SEQ), "kind": kind, "payload": payload,
+                "label": _links_job_label(kind, payload), "enqueued_at": _now_iso(),
+            })
+            return ("queued", len(LINKS_QUEUE))
+        entry = {"kind": kind, "payload": payload, "label": _links_job_label(kind, payload)}
+        # 在锁内同步置位运行状态：start 返回时 status 立即可见，连发请求不会双跑
+        LINKS_JOB = {
+            "status": "running", "kind": kind, "total": 0, "resolved": 0,
+            "downloaded": 0, "errors": 0, "label": entry["label"],
+            "message": "准备开始…", "error": "",
+            "started_at": _now_iso(), "finished_at": "", "updated_at": _now_iso(),
+        }
+        LINKS_GENERATION += 1
+        gen = LINKS_GENERATION
+        LINKS_THREAD = threading.Thread(target=_links_runner, args=(gen, entry),
                                         daemon=True, name="links-worker")
         LINKS_THREAD.start()
+        return ("started", 0)
+
+
+def _force_stop_links() -> bool:
+    """强制停止下载任务：立即释放「运行中」状态位（机制同订阅强制停止）。"""
+    global LINKS_GENERATION
+    with LINKS_LOCK:
+        job = LINKS_JOB
+        if not job or job.get("status") != "running":
+            return False
+        job["stop"] = True
+        job["status"] = "stopped"
+        job["message"] = "已强制停止；后台若仍有残留下载，会自行结束"
+        job["finished_at"] = _now_iso()
+        LINKS_GENERATION += 1
         return True
 
 
@@ -633,7 +843,7 @@ def _subscription_scheduler_loop() -> None:
     while True:
         try:
             if store.due_subscriptions(Handler.db):
-                _start_subscription_refresh(0)
+                _start_subscription_refresh(0, from_scheduler=True)
         except Exception:
             pass
         time.sleep(3600)
@@ -804,7 +1014,16 @@ class Handler(BaseHTTPRequestHandler):
             length = 0
         if length <= 0:
             return {}
-        raw = self.rfile.read(length).decode("utf-8", "replace")
+        raw_bytes = self.rfile.read(length)
+        try:
+            raw = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            # 严格 UTF-8：坏编码直接拒绝。此前用 errors="replace" 静默吞掉，
+            # Windows GBK 控制台发来的中文会变成 U+FFFD 存进配置（整理规则乱码的根因）。
+            raise _BodyError(
+                "请求体不是有效的 UTF-8，已拒绝以避免存入乱码。"
+                "请在面板里提交中文，或 curl 前先执行 chcp 65001；"
+                f"解码失败位置：{exc}") from exc
         try:
             return json.loads(raw) or {}
         except (ValueError, TypeError):
@@ -1351,7 +1570,11 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         # 资产包导入是二进制 zip 请求体，由对应分支自行按字节读取，不能按 JSON 预读
-        body = {} if path == "/api/migrate/import" else self._read_body()
+        try:
+            body = {} if path == "/api/migrate/import" else self._read_body()
+        except _BodyError as exc:
+            self._json({"ok": False, "error": str(exc)}, status=400)
+            return
         worker = WORKER
 
         if path == "/api/collect/start":
@@ -1400,9 +1623,9 @@ class Handler(BaseHTTPRequestHandler):
             if not lines:
                 self._json({"ok": False, "error": "请粘贴至少一条视频链接"}, status=400)
                 return
-            started = _start_links_job("links", {"text": text, "category": category})
-            if not started:
-                self._json({"ok": False, "error": "已有下载任务在运行"}, status=409)
+            state, pos = _start_links_job("links", {"text": text, "category": category})
+            if state == "queued":
+                self._json({"ok": True, "queued": True, "position": pos, **_links_status()})
                 return
             self._json({"ok": True, **_links_status()})
         elif path == "/api/bili/collect":
@@ -1415,14 +1638,35 @@ class Handler(BaseHTTPRequestHandler):
                 count = max(1, min(int(body.get("count", 5) or 5), 30))
             except (ValueError, TypeError):
                 count = 5
-            started = _start_links_job(f"bili_{mode}", {
+            state, pos = _start_links_job(f"bili_{mode}", {
                 "keyword": keyword, "count": count,
                 "category": str(body.get("category", "")).strip() or (keyword or "B站热门"),
             })
-            if not started:
-                self._json({"ok": False, "error": "已有下载任务在运行"}, status=409)
+            if state == "queued":
+                self._json({"ok": True, "queued": True, "position": pos, **_links_status()})
                 return
             self._json({"ok": True, **_links_status()})
+        elif path == "/api/links/stop":
+            # force=true 强制停止：立即释放运行位（卡死恢复用）；默认协作式，当前视频完成后停止
+            if bool(body.get("force")):
+                _force_stop_links()
+            else:
+                with LINKS_LOCK:
+                    if LINKS_JOB and LINKS_JOB.get("status") == "running":
+                        LINKS_JOB["stop"] = True
+                        _links_update(LINKS_JOB, message="停止请求已发出，当前视频完成后停止…")
+            self._json({"ok": True, **_links_status()})
+        elif path == "/api/links/queue":
+            with LINKS_LOCK:
+                if body.get("clear"):
+                    removed = len(LINKS_QUEUE)
+                    LINKS_QUEUE.clear()
+                else:
+                    qid = body.get("remove")
+                    before = len(LINKS_QUEUE)
+                    LINKS_QUEUE[:] = [q for q in LINKS_QUEUE if str(q.get("id")) != str(qid)]
+                    removed = before - len(LINKS_QUEUE)
+            self._json({"ok": True, "removed": removed, **_links_status()})
         elif path == "/api/favorites/create":
             name = str(body.get("name", "")).strip()
             if not name:
@@ -1507,11 +1751,32 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, "id": sid, **_subscription_status()})
         elif path == "/api/subscriptions/refresh":
             sid = int(body.get("id", 0) or 0)
-            started = _start_subscription_refresh(sid)
-            if not started:
-                self._json({"ok": False, "error": "订阅更新已在运行"}, status=409)
+            state, pos = _start_subscription_refresh(sid)
+            if state == "queued":
+                self._json({"ok": True, "queued": True, "position": pos, **_subscription_status()})
                 return
             self._json({"ok": True, **_subscription_status()})
+        elif path == "/api/subscriptions/stop":
+            # force=true 强制停止：立即释放运行位（卡死恢复用）；默认协作式，当前视频完成后停止
+            if bool(body.get("force")):
+                _force_stop_subscription()
+            else:
+                with SUBSCRIPTION_LOCK:
+                    if SUBSCRIPTION_JOB and SUBSCRIPTION_JOB.get("status") == "running":
+                        SUBSCRIPTION_JOB["stop"] = True
+                        _subscription_update(SUBSCRIPTION_JOB, message="停止请求已发出，当前视频完成后停止…")
+            self._json({"ok": True, **_subscription_status()})
+        elif path == "/api/subscriptions/queue":
+            with SUBSCRIPTION_LOCK:
+                if body.get("clear"):
+                    removed = len(SUBSCRIPTION_QUEUE)
+                    SUBSCRIPTION_QUEUE.clear()
+                else:
+                    qid = body.get("remove")
+                    before = len(SUBSCRIPTION_QUEUE)
+                    SUBSCRIPTION_QUEUE[:] = [q for q in SUBSCRIPTION_QUEUE if str(q.get("id")) != str(qid)]
+                    removed = before - len(SUBSCRIPTION_QUEUE)
+            self._json({"ok": True, "removed": removed, **_subscription_status()})
         elif path == "/api/subscriptions/delete":
             sid = int(body.get("id", 0) or 0)
             self._json({"ok": bool(sid) and store.delete_subscription(self.db, sid)})

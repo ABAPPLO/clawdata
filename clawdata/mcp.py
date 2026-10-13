@@ -295,7 +295,8 @@ def _build() -> "FastMCP":  # noqa: F821 - 延迟导入后类型仅作注释
     @mcp.tool()
     def job_status(kind: str = "download") -> str:
         """轮询后台任务进度。kind 可选：collect(热点采集)/download(链接与B站下载)/
-        digest(文库整理)/subscriptions(订阅刷新)/migrate(数据迁移)/tag(打标)。"""
+        digest(文库整理)/subscriptions(订阅刷新)/migrate(数据迁移)/tag(打标)。
+        download/subscriptions 的返回含 queued（排队中任务）与 stalled（超10分钟无进展）。"""
         kind = (kind or "").strip().lower()
         mapping = {
             "collect": "/api/collect/status",
@@ -309,8 +310,22 @@ def _build() -> "FastMCP":  # noqa: F821 - 延迟导入后类型仅作注释
             return f"未知 kind：{kind}，可选：{'/'.join(mapping)}"
         v = _get(mapping[kind])
         if kind == "subscriptions":
-            v = {"active": v.get("active"), "job": v.get("job")}
+            v = {"active": v.get("active"), "job": v.get("job"), "queued": v.get("queued")}
         return _j(v, limit=3000)
+
+    @mcp.tool()
+    def job_stop(kind: str = "download", force: bool = False) -> str:
+        """停止后台任务。kind 可选：download(链接与B站下载)/subscriptions(订阅刷新)。
+        默认协作式：当前视频完成后停止，排队任务保留；force=true 强制停止——
+        任务疑似卡死（job_status 显示 stalled）时用它立即释放运行位，之后可重新启动。"""
+        kind = (kind or "").strip().lower()
+        mapping = {
+            "download": "/api/links/stop",
+            "subscriptions": "/api/subscriptions/stop",
+        }
+        if kind not in mapping:
+            return f"未知 kind：{kind}，可选：{'/'.join(mapping)}"
+        return _j(_post(mapping[kind], {"force": bool(force)}))
 
     return mcp
 
